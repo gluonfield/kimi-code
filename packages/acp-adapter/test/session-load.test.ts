@@ -90,6 +90,7 @@ function makeHarness(
     hasUsableToken?: boolean;
     session?: Session;
     resumeError?: Error;
+    resumeInputs?: unknown[];
   },
 ): KimiHarness {
   const authed = opts.hasUsableToken ?? true;
@@ -97,7 +98,8 @@ function makeHarness(
     auth: {
       status: async () => (authed ? AUTHED_STATUS : UNAUTHED_STATUS),
     },
-    resumeSession: async (_input: { id: string }) => {
+    resumeSession: async (input: { id: string }) => {
+      opts.resumeInputs?.push(input);
       if (opts.resumeError) throw opts.resumeError;
       if (!opts.session) throw new Error('test harness has no session configured');
       return opts.session;
@@ -134,6 +136,30 @@ describe('AcpServer session/load auth gate', () => {
 });
 
 describe('AcpServer session/load replay', () => {
+  it('forwards host system instructions from ACP metadata', async () => {
+    const sessionId = 'sess-system';
+    const resumeInputs: unknown[] = [];
+    const harness = makeHarness({
+      session: makeSessionWithHistory(sessionId, []),
+      resumeInputs,
+    });
+    const { agentStream, clientStream } = makeInMemoryStreamPair();
+
+    new AgentSideConnection((c) => new AcpServer(harness, c), agentStream);
+    const client = new ClientSideConnection((_a) => new CapturingClient(), clientStream);
+
+    await client.loadSession({
+      sessionId,
+      cwd: '/tmp/x',
+      mcpServers: [],
+      _meta: { systemPrompt: 'Host system instructions.' },
+    });
+
+    expect(resumeInputs).toContainEqual(
+      expect.objectContaining({ systemPromptAppend: 'Host system instructions.' }),
+    );
+  });
+
   it('replays a single assistant text-only turn as agent_message_chunk updates', async () => {
     const sessionId = 'sess-text-only';
     const history = [

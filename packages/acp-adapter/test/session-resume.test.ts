@@ -101,13 +101,15 @@ function makeHarness(opts: {
   hasUsableToken?: boolean;
   session?: Session;
   resumeError?: Error;
+  resumeInputs?: unknown[];
 }): KimiHarness {
   const authed = opts.hasUsableToken ?? true;
   return {
     auth: {
       status: async () => (authed ? AUTHED_STATUS : UNAUTHED_STATUS),
     },
-    resumeSession: async (_input: { id: string }) => {
+    resumeSession: async (input: { id: string }) => {
+      opts.resumeInputs?.push(input);
       if (opts.resumeError) throw opts.resumeError;
       if (!opts.session) throw new Error('test harness has no session configured');
       return opts.session;
@@ -127,6 +129,30 @@ function makeHarness(opts: {
 }
 
 describe('AcpServer.resumeSession', () => {
+  it('forwards host system instructions from ACP metadata', async () => {
+    const sessionId = 'sess-system';
+    const resumeInputs: unknown[] = [];
+    const harness = makeHarness({
+      session: makeSessionWithMainConfig(sessionId),
+      resumeInputs,
+    });
+    const { agentStream, clientStream } = makeInMemoryStreamPair();
+
+    new AgentSideConnection((c) => new AcpServer(harness, c), agentStream);
+    const client = new ClientSideConnection((_a) => new CapturingClient(), clientStream);
+
+    await client.resumeSession({
+      sessionId,
+      cwd: '/tmp/x',
+      mcpServers: [],
+      _meta: { systemPrompt: 'Host system instructions.' },
+    });
+
+    expect(resumeInputs).toContainEqual(
+      expect.objectContaining({ systemPromptAppend: 'Host system instructions.' }),
+    );
+  });
+
   it('auth gate rejects with authRequired (-32000) when no token', async () => {
     const harness = makeHarness({ hasUsableToken: false });
     const { agentStream, clientStream } = makeInMemoryStreamPair();

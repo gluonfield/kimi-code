@@ -107,6 +107,45 @@ describe('Agent config', () => {
     expect(ctx.agent.config.systemPrompt).toBe('Prompt with additional dirs: none');
   });
 
+  it('appends host instructions only at the LLM system boundary', async () => {
+    const ctx = testAgent({ systemPromptAppend: 'Host system instructions.' });
+    ctx.configure();
+
+    expect(ctx.agent.config.systemPrompt).toBe(DEFAULT_TEST_SYSTEM_PROMPT);
+
+    ctx.mockNextResponse({ type: 'text', text: 'Done.' });
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Hello' }] });
+    await ctx.untilTurnEnd();
+
+    expect(ctx.lastLlmInput()).toMatchInlineSnapshot(`
+      system: "You are a deterministic test agent.\\n\\nHost system instructions."
+      tools: []
+      messages:
+        user: text "Hello"
+    `);
+
+    ctx.appendExchange(1, 'User history', 'Assistant history', 40);
+    ctx.mockNextResponse({ type: 'text', text: 'Summary.' });
+    await ctx.rpc.beginCompaction({});
+    await ctx.once('compaction.completed');
+
+    expect(ctx.llmCalls.at(-1)?.systemPrompt).toBe(
+      'You are a deterministic test agent.\n\nHost system instructions.',
+    );
+
+    const profile: ResolvedAgentProfile = {
+      name: 'refreshed-profile',
+      systemPrompt: () => 'Refreshed native prompt.',
+      tools: [],
+    };
+    ctx.agent.useProfile(profile);
+
+    expect(ctx.agent.config.systemPrompt).toBe('Refreshed native prompt.');
+    expect(ctx.agent.systemPrompt).toBe(
+      'Refreshed native prompt.\n\nHost system instructions.',
+    );
+  });
+
   it('config.update with cwd initializes builtin tools', async () => {
     const ctx = testAgent();
     ctx.configure();

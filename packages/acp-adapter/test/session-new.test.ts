@@ -46,7 +46,12 @@ function makeInMemoryStreamPair(): {
 }
 
 interface CapturedCall {
-  options: { id?: string; workDir: string; mcpServers?: Record<string, unknown> };
+  options: {
+    id?: string;
+    workDir: string;
+    mcpServers?: Record<string, unknown>;
+    systemPromptAppend?: string;
+  };
 }
 
 function makeHarness(
@@ -121,6 +126,23 @@ describe('AcpServer session/new', () => {
     // The wrapper is stashed in the map under the same id we returned to
     // the client (so Phase 3.3/3.4 can look it up by sessionId).
     expect(server?.getSession(response.sessionId)?.id).toBe(response.sessionId);
+  });
+
+  it('forwards host system instructions from ACP metadata', async () => {
+    const captured: CapturedCall[] = [];
+    const { harness } = makeHarness('sess-system', captured);
+    const { agentStream, clientStream } = makeInMemoryStreamPair();
+
+    new AgentSideConnection((c) => new AcpServer(harness, c), agentStream);
+    const client = new ClientSideConnection((_a) => new StubClient(), clientStream);
+
+    await client.newSession({
+      cwd: '/tmp/work',
+      mcpServers: [],
+      _meta: { systemPrompt: 'Host system instructions.' },
+    });
+
+    expect(captured[0]?.options.systemPromptAppend).toBe('Host system instructions.');
   });
 
   it('returns a distinct sessionId per call (one createSession per request)', async () => {

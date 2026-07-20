@@ -102,6 +102,7 @@ export interface AgentOptions {
   readonly replay?: ReplayBuilderOptions;
   readonly additionalDirs?: readonly string[];
   readonly systemPromptContextProvider?: (() => Promise<PreparedSystemPromptContext>) | undefined;
+  readonly systemPromptAppend?: string;
 }
 
 export class Agent {
@@ -172,6 +173,7 @@ export class Agent {
     readonly knownEfforts: string | undefined;
   }> = [];
   private readonly systemPromptContextProvider?: (() => Promise<PreparedSystemPromptContext>) | undefined;
+  private readonly systemPromptAppend: string;
 
   constructor(options: AgentOptions) {
     this.type = options.type ?? 'main';
@@ -194,6 +196,7 @@ export class Agent {
     this.imageLimits = options.imageLimits ?? new ImageLimits();
     this.additionalDirs = normalizeAdditionalDirs(options.additionalDirs ?? []);
     this.systemPromptContextProvider = options.systemPromptContextProvider;
+    this.systemPromptAppend = options.systemPromptAppend ?? '';
 
     this.llmRequestLogger = new LlmRequestLogger(this.log);
     this.llmRequestRecorder = new LlmRequestRecorder(this);
@@ -425,12 +428,18 @@ export class Agent {
     });
     return new KosongLLM({
       provider,
-      systemPrompt: this.config.systemPrompt,
+      systemPrompt: this.systemPrompt,
       capability: this.config.modelCapabilities,
       generate: this.generate,
       completionBudgetConfig,
       usedContextTokens: () => this.context.tokenCount,
     });
+  }
+
+  get systemPrompt(): string {
+    const base = this.config.systemPrompt;
+    if (this.systemPromptAppend === '') return base;
+    return base === '' ? this.systemPromptAppend : `${base}\n\n${this.systemPromptAppend}`;
   }
 
   useProfile(

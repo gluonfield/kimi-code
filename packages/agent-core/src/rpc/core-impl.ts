@@ -380,6 +380,7 @@ export class KimiCore implements PromisableMethods<CoreAPI> {
       appVersion: this.appVersion,
       additionalDirs,
       drainAgentTasksOnStop: options.drainAgentTasksOnStop,
+      systemPromptAppend: options.systemPromptAppend,
     });
     try {
       session.metadata = {
@@ -525,6 +526,7 @@ export class KimiCore implements PromisableMethods<CoreAPI> {
       pluginCommands,
       appVersion: this.appVersion,
       additionalDirs,
+      systemPromptAppend: input.systemPromptAppend,
     });
     let warning: string | undefined;
     try {

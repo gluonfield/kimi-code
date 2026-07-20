@@ -116,6 +116,7 @@ export interface CreateSessionOptions {
    * interactive / SDK sessions.
    */
   readonly drainAgentTasksOnStop?: boolean;
+  readonly systemPromptAppend?: string;
 }
 
 export interface RenameSessionInput {
@@ -131,6 +132,7 @@ export interface ResumeSessionInput {
   /** Include persisted subagent states in the returned replay snapshot. */
   readonly includeSubagents?: boolean;
   readonly sessionStartedProperties?: TelemetryProperties;
+  readonly systemPromptAppend?: string;
 }
 
 export interface ReloadSessionInput extends ResumeSessionInput {

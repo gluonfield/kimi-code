@@ -87,6 +87,7 @@ export interface SessionOptions {
    * finish before the run exits. Set via the SDK `createSession` option.
    */
   readonly drainAgentTasksOnStop?: boolean;
+  readonly systemPromptAppend?: string;
 }
 
 export interface SessionSkillConfig {
@@ -948,6 +949,7 @@ export class Session {
       experimentalFlags: this.experimentalFlags,
       imageLimits: this.imageLimits,
       additionalDirs: parentAgent?.getAdditionalDirs() ?? this.additionalDirs,
+      systemPromptAppend: this.options.systemPromptAppend,
       systemPromptContextProvider: () =>
         prepareSystemPromptContext(
           this.systemContextKaos(agent.kaos.getcwd()),

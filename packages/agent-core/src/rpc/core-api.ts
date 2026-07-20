@@ -63,6 +63,7 @@ export interface CreateSessionPayload {
   readonly additionalDirs?: readonly string[];
   readonly client?: ClientTelemetryInfo | undefined;
   readonly drainAgentTasksOnStop?: boolean;
+  readonly systemPromptAppend?: string;
 }
 
 export interface CloseSessionPayload {
@@ -83,6 +84,7 @@ export interface ResumeSessionPayload {
   readonly additionalDirs?: readonly string[];
   /** Include persisted subagent states in the returned replay snapshot. */
   readonly includeSubagents?: boolean;
+  readonly systemPromptAppend?: string;
 }
 
 export interface ReloadSessionPayload {

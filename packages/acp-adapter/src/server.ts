@@ -299,6 +299,7 @@ export class AcpServer implements Agent {
       // (agent-core `CreateSessionPayload`) the SDK transparently
       // forwards via spread. See block comment above.
       mcpServers,
+      systemPromptAppend: systemPromptAppend(params._meta),
     });
     const currentModelId = await this.resolveCurrentModelId();
     const currentThinkingEnabled = await this.resolveCurrentThinkingEnabled(session);
@@ -365,6 +366,7 @@ export class AcpServer implements Agent {
       cwd: params.cwd,
       sessionId: params.sessionId,
       mcpServers: params.mcpServers,
+      systemPromptAppend: systemPromptAppend(params._meta),
       mode: 'load',
     });
     // Synchronously replay history — the response must not settle
@@ -401,6 +403,7 @@ export class AcpServer implements Agent {
       cwd: params.cwd,
       sessionId: params.sessionId,
       mcpServers: params.mcpServers,
+      systemPromptAppend: systemPromptAppend(params._meta),
       mode: 'resume',
     });
     this.scheduleAvailableCommandsUpdate(session.id);
@@ -434,6 +437,7 @@ export class AcpServer implements Agent {
     cwd: string;
     sessionId: string;
     mcpServers?: ReadonlyArray<McpServer>;
+    systemPromptAppend?: string;
     mode: 'load' | 'resume';
   }): Promise<{
     session: Session;
@@ -468,6 +472,7 @@ export class AcpServer implements Agent {
         // @ts-expect-error — see block comment above; mcpServers is a
         // kernel-only field that the SDK forwards via spread.
         mcpServers,
+        systemPromptAppend: params.systemPromptAppend,
       });
     } catch (err) {
       // Surface unknown-session as invalid_params so the JSON-RPC layer
@@ -939,6 +944,11 @@ export class AcpServer implements Agent {
     }
   }
 
+}
+
+function systemPromptAppend(meta: Record<string, unknown> | null | undefined): string | undefined {
+  const value = meta?.['systemPrompt'];
+  return typeof value === 'string' ? value.trim() || undefined : undefined;
 }
 
 /**

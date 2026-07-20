@@ -99,7 +99,7 @@ export class LlmRequestRecorder {
       toolSelect: this.agent.toolSelectEnabled,
       systemPromptHash: this.systemPromptHashFor(systemPrompt),
       systemPrompt:
-        systemPrompt === this.agent.config.systemPrompt ? undefined : systemPrompt,
+        systemPrompt === this.agent.systemPrompt ? undefined : systemPrompt,
       toolsHash,
       messageCount: messages.length,
       turnStep: fields.turnStep,

@@ -236,7 +236,7 @@ export class FullCompaction {
 
   private estimateRequestTokens(messages: readonly Message[]): number {
     return (
-      estimateTokens(this.agent.config.systemPrompt) +
+      estimateTokens(this.agent.systemPrompt) +
       // Deferred tools never reach the outbound top-level tools[] (kosong
       // generate() strips them); keep the estimate aligned with the wire.
       estimateTokensForTools(this.agent.tools.loopTools.filter((t) => t.deferred !== true)) +
@@ -479,7 +479,7 @@ export class FullCompaction {
           };
           const response = await this.agent.generate(
             provider,
-            this.agent.config.systemPrompt,
+            this.agent.systemPrompt,
             [...this.agent.tools.loopTools],
             messages,
             undefined,
