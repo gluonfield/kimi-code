@@ -1,5 +1,11 @@
 # @moonshot-ai/kimi-code
 
+## 0.28.1
+
+### Patch Changes
+
+- [#1948](https://github.com/MoonshotAI/kimi-code/pull/1948) [`f6f4192`](https://github.com/MoonshotAI/kimi-code/commit/f6f4192957ace3f0cceb734a04b3b26b1d2f88be) Thanks [@sailist](https://github.com/sailist)! - Fix running subagents not observing permission mode switches made after they started.
+
 ## 0.28.0
 
 ### Minor Changes
