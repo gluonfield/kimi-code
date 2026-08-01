@@ -6,11 +6,12 @@ import {
   APIContextOverflowError,
   APIEmptyResponseError,
   APIProviderOverloadedError,
+  APIProviderQuotaExhaustedError,
   APIStatusError,
   APITimeoutError,
   ChatProviderError,
-} from '#/app/llmProtocol/errors';
-import { translateProviderError } from '#/app/protocol/errors';
+} from '#/kosong/contract/errors';
+import { translateProviderError } from '#/kosong/protocol/errors';
 
 const NGINX_413_HTML =
   '413 <html>\r\n<head><title>413 Request Entity Too Large</title></head>\r\n' +
@@ -150,6 +151,20 @@ describe('translateProviderError', () => {
       expect(translateProviderError(new APIStatusError(401, 'Unauthorized')).code).toBe(
         'provider.auth_error',
       );
+    });
+  });
+
+  describe('quota-exhausted 429', () => {
+    it('maps to provider.api_error, not provider.rate_limit', () => {
+      const translated = translateProviderError(
+        new APIProviderQuotaExhaustedError(
+          'Your account is suspended due to insufficient balance, please recharge your account',
+          'req-quota',
+        ),
+      );
+      expect(translated.code).toBe('provider.api_error');
+      expect(translated.message).toContain('recharge');
+      expect(translated.details).toMatchObject({ statusCode: 429, requestId: 'req-quota' });
     });
   });
 });

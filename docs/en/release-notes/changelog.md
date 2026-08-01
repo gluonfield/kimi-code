@@ -6,6 +6,105 @@ outline: 2
 
 This page documents the changes in each Kimi Code CLI release.
 
+## 0.31.0 (2026-07-30)
+
+### Features
+
+- Support Markdown-defined custom agents on agent-core.
+- Add the /secondary_model slash command to configure the secondary model used by subagents (experimental; enable it in /experiments first).
+- Plugins can contribute custom agents, discovered automatically and available for sub-agent delegation.
+- Plugins can contribute system prompt instructions through `systemPrompt` or `systemPromptPath` in `kimi.plugin.json`.
+
+### Bug Fixes
+
+- Remove the blocking `block`/`timeout` wait from the TaskOutput tool so checking a background task can no longer stall the conversation; it now always returns an immediate snapshot, and completion still arrives via automatic notification.
+- Fix sessions missing from the session picker when their cached metadata predates the archived flag.
+- Fix request headers not being passed correctly on some requests.
+
+## 0.30.0 (2026-07-29)
+
+### Features
+
+- Add a customizable footer status line, configured via `[status_line]` in `tui.toml`.
+
+### Polish
+
+- Show a quota note after installing official plugins that bill against plan quota (such as Kimi Datasource).
+- Show a notice when an official plugin used in the session has an update available — run /plugins to update.
+- Remove the 50 MB size limit on file uploads to the built-in server.
+
+### Bug Fixes
+
+- Fail fast when account quota or balance is exhausted instead of silently retrying for ~3 minutes.
+- Stop the turn after repeated invalid tool calls instead of retrying indefinitely.
+- web: Fix garbled line numbers in code blocks.
+
+## 0.29.2 (2026-07-27)
+
+### Bug Fixes
+
+- Fix goal pursuit pausing when a goal turn hits the per-turn step limit (`loop_control.max_steps_per_turn`).
+- Fix messages sent during goal pursuit being rejected.
+- Fix /undo to restore conversation history, todo lists, plan mode, and task notifications consistently.
+- web: Fix copying selected chat text over plain HTTP overwriting the clipboard with an event placeholder.
+
+## 0.29.1 (2026-07-24)
+
+### Features
+
+- Add global default MCP server timeouts in `config.toml` and env vars.
+- Add environment variables to configure the web search and web fetch services without OAuth login.
+- Add experimental secondary-model bindings for newly spawned subagents, including per-agent model preferences and subagent-only model overrides.
+
+### Bug Fixes
+
+- Fix loss of thinking content with OpenAI-compatible endpoints that return reasoning under a different field name (e.g. newer vLLM).
+
+## 0.29.0 (2026-07-22)
+
+### Features
+
+- web: Support defining agents in Markdown files, declaring system prompt, name, description, and tool permissions. [Details](https://moonshotai.github.io/kimi-code/en/customization/agents.html#agent-file-format)
+- web: Permanently override the main agent's system prompt with SYSTEM.md. [Details](https://moonshotai.github.io/kimi-code/en/customization/agents.html#overriding-the-main-agent-s-system-prompt-with-system-md)
+- web: Globally enable or disable tools across all sessions via config.toml. [Details](https://moonshotai.github.io/kimi-code/en/configuration/config-files.html#tools)
+- Videos attached to a prompt now reach the model together with the prompt, with no extra tool round trip.
+- Support selecting a thinking effort level from ACP clients.
+- Add environment variable overrides for agent loop and background task limits.
+
+### Polish
+
+- Import many more providers from the models.dev catalog.
+- Improve TUI performance and resume speed for long-running sessions.
+- Reconnect a dropped MCP server connection automatically when one of its tools is called, and retry the call once.
+- Remove red coloring from syntax highlighting in code previews and markdown code blocks.
+- Add a reminder for third-party install sources to use the official installer in the update prompt.
+
+### Bug Fixes
+
+- Fix sessions getting stuck with a provider "message must not be empty" error after a content-filtered response.
+- Fix cancelled model requests being wrapped as retryable provider errors.
+- Fix thinking levels being offered for models that do not support them.
+- Fix config environment overrides being persisted into config.toml while the env var is set.
+- Send the session prompt cache key to OpenAI and OpenAI Responses providers.
+- Fix ReadMediaFile failing on videos when the provider has no file upload channel.
+- Fix goal mode continuation prompts leaking into the transcript when resuming a session.
+- web: Show transparent images over a checkerboard canvas.
+- Remove references to the non-existent `kimi resume` command from the scheduled-task tool descriptions.
+
+## 0.28.1 (2026-07-20)
+
+### Features
+
+- Allow ACP sessions to start with configured non-OAuth model credentials instead of requiring terminal login.
+
+### Polish
+
+- Run web servers foreground-only end to end: the /web slash command now always starts a new server, and the `kimi web kill` / `kimi web ps` subcommands are removed — foreground servers stop with Ctrl+C. `kimi server kill` remains as a deprecated fallback that only stops servers started by a version before 0.28.0.
+
+### Bug Fixes
+
+- Fix running subagents not observing permission mode switches made after they started.
+
 ## 0.28.0 (2026-07-20)
 
 ### Features

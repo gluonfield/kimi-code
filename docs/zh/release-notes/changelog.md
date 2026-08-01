@@ -6,6 +6,105 @@ outline: 2
 
 本页记录 Kimi Code CLI 每个版本的变更内容。
 
+## 0.31.0（2026-07-30）
+
+### 新功能
+
+- TUI 支持 Markdown 定义的自定义 Agent。
+- 新增 /secondary_model 斜杠命令，用于配置子 Agent 使用的辅助模型（实验性功能，需先在 /experiments 中开启）。
+- 插件可贡献自定义 Agent，自动发现并可用于子 Agent 委派。
+- 插件可贡献系统提示词，通过 `kimi.plugin.json` 中的 `systemPrompt` 或 `systemPromptPath` 声明。
+
+### 修复
+
+- 移除 TaskOutput 工具的阻塞式 `block`/`timeout` 等待。
+- 修复会话元数据缓存早于 archived 标记时会话选择器缺少会话的问题。
+- 修复部分请求未能正确传递请求头的问题。
+
+## 0.30.0（2026-07-29）
+
+### 新功能
+
+- 新增可自定义的底部状态栏，可通过 `tui.toml` 中的 `[status_line]` 配置。
+
+### 优化
+
+- 安装会计入套餐额度的官方插件（如 Kimi Datasource）后，显示额度说明。
+- 会话中使用的官方插件有可用更新时显示提示，可运行 /plugins 更新。
+- 移除内置服务器文件上传的 50 MB 大小限制。
+
+### 修复
+
+- 修复账户额度或余额耗尽时静默重试约 3 分钟的问题，现在会立即报错。
+- 修复工具调用反复无效时无限重试的问题，现在会终止当前回合。
+- web: 修复代码块中行号乱码的问题。
+
+## 0.29.2（2026-07-27）
+
+### 修复
+
+- 修复目标执行在单轮达到步数上限（`loop_control.max_steps_per_turn`）后暂停的问题。
+- 修复目标运行期间发送的消息被拒绝的问题。
+- 修复 /undo 无法一致恢复对话历史、待办列表、计划模式和任务通知的问题。
+- web: 修复纯 HTTP 环境下复制选中聊天文本时，剪贴板被事件占位符覆盖的问题。
+
+## 0.29.1（2026-07-24）
+
+### 新功能
+
+- 支持在 `config.toml` 与环境变量中配置全局默认的 MCP 服务器超时时间。
+- 新增用于配置网页搜索与网页抓取服务的环境变量，无需 OAuth 登录。
+- 新增实验性的子 Agent 辅助模型绑定，支持按 Agent 设置模型偏好及仅对子 Agent 生效的模型覆盖。
+
+### 修复
+
+- 修复部分 OpenAI 兼容端点（如新版 vLLM）以其他字段名返回 reasoning 导致思考内容丢失的问题。
+
+## 0.29.0（2026-07-22）
+
+### 新功能
+
+- web: 支持 Markdown 文件定义 agent，声明 system prompt、名称、描述和工具权限。[查看文档](https://moonshotai.github.io/kimi-code/en/customization/agents.html#agent-file-format)
+- web: 可通过 SYSTEM.md 永久覆盖主 agent 的系统提示。[查看文档](https://moonshotai.github.io/kimi-code/en/customization/agents.html#overriding-the-main-agent-s-system-prompt-with-system-md)
+- web: 可通过 config.toml 在所有会话中统一启用/禁用工具。[查看文档](https://moonshotai.github.io/kimi-code/en/configuration/config-files.html#tools)
+- 附加到提示词的视频现在会随提示词一起送达模型，无需额外的工具轮次。
+- ACP 客户端现支持选择思考强度。
+- 新增 Agent 循环与后台任务限制的环境变量覆盖：`KIMI_LOOP_MAX_STEPS_PER_TURN`、`KIMI_LOOP_MAX_RETRIES_PER_STEP` 和 `KIMI_CODE_BACKGROUND_MAX_RUNNING_TASKS`。
+
+### 优化
+
+- 从 models.dev 目录导入更多供应商。
+- 提升 TUI 在长会话中的性能与恢复速度。
+- 当 MCP 服务器的某个工具被调用时，若连接已断开可自动重连，并自动重试一次该调用。
+- 移除代码预览与 Markdown 代码块语法高亮中的红色配色。
+- 在更新提示中为第三方安装来源增加使用官方安装器的提醒。
+
+### 修复
+
+- 修复内容过滤响应后，会话卡住并报 "message must not be empty" 错误的问题。
+- 修复被取消的模型请求被包装为可重试的供应商错误的问题。
+- 修复为不支持的模型提供思考强度选项的问题。
+- 修复环境变量覆盖值在环境变量设置期间被持久化到 config.toml 的问题。
+- 将会话提示词缓存键发送给 OpenAI 与 OpenAI Responses 供应商。
+- 修复当供应商没有文件上传通道时 `ReadMediaFile` 处理视频失败的问题。
+- 修复恢复会话时目标模式续行提示词泄漏到对话记录中的问题。
+- web: 在透明图片下方显示棋盘格画布。
+- 移除定时任务工具描述中对不存在的 `kimi resume` 命令的引用。
+
+## 0.28.1（2026-07-20）
+
+### 新功能
+
+- ACP 会话现支持使用已配置的非 OAuth 模型凭据启动，无需再在终端登录。
+
+### 优化
+
+- `kimi web` 服务器改为全程前台运行：`/web` 斜杠命令现在总是启动新服务器，`kimi web kill` 与 `kimi web ps` 子命令已移除，前台服务器按 Ctrl+C 即可停止。`kimi server kill` 保留为废弃回退，仅能停止 0.28.0 之前版本启动的服务器。
+
+### 修复
+
+- 修复权限模式切换对已在运行的子 Agent 不生效的问题。
+
 ## 0.28.0（2026-07-20）
 
 ### 新功能
