@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { DOUBLE_ESC_WINDOW_MS } from '#/tui/constant/kimi-tui';
+import { DOUBLE_ESC_WINDOW_MS, NO_ACTIVE_SESSION_MESSAGE } from '#/tui/constant/kimi-tui';
 import {
   EditorKeyboardController,
   type EditorKeyboardHost,
@@ -46,6 +46,8 @@ function createHarness(options: { streamingPhase?: string; isCompacting?: boolea
     btwPanelController: { cancelRunning: btwCancelRunning, closeOrCancel: btwCloseOrCancel },
     openUndoSelector,
     cancelRunningShellCommand,
+    updateEditorBorderHighlight: vi.fn(),
+    updateGoalLengthWarning: vi.fn(),
   } as unknown as EditorKeyboardHost;
 
   const controller = new EditorKeyboardController(
@@ -283,5 +285,243 @@ describe('EditorKeyboardController shell history recall', () => {
     restore('prompt');
 
     expect(editor['setInputMode'] as unknown as Mock).toHaveBeenCalledWith('prompt');
+  });
+});
+
+describe('EditorKeyboardController input changes', () => {
+  function installExpandedText(
+    editor: Harness['editor'],
+    expanded: string,
+  ): ReturnType<typeof vi.fn> {
+    const getExpandedText = vi.fn(() => expanded);
+    editor['getExpandedText'] = getExpandedText as unknown as (...args: never[]) => unknown;
+    return getExpandedText;
+  }
+
+  it('forwards text changes to the border highlight and goal length warning', () => {
+    const { host, editor } = createHarness();
+    installExpandedText(editor, '/goal Ship feature X');
+    const onChange = editor['onChange'] as unknown as (text: string) => void;
+
+    onChange('/goal Ship feature X');
+
+    expect(host.updateEditorBorderHighlight).toHaveBeenCalledWith('/goal Ship feature X');
+    expect(host.updateGoalLengthWarning).toHaveBeenCalledWith('/goal Ship feature X');
+  });
+
+  it('measures the goal length warning on paste-expanded text, not the collapsed marker', () => {
+    const { host, editor } = createHarness();
+    const expanded = `/goal ${'x'.repeat(4001)}`;
+    installExpandedText(editor, expanded);
+    const onChange = editor['onChange'] as unknown as (text: string) => void;
+
+    // The visible text only holds the collapsed paste marker.
+    onChange('/goal [paste #1 +4000 chars]');
+
+    expect(host.updateGoalLengthWarning).toHaveBeenCalledWith(expanded);
+  });
+
+  it('expands a leading paste marker because its content may start with /goal', () => {
+    const { host, editor } = createHarness();
+    const expanded = `/goal ${'x'.repeat(4001)}`;
+    const getExpandedText = installExpandedText(editor, expanded);
+    const onChange = editor['onChange'] as unknown as (text: string) => void;
+
+    onChange('[paste #1 +4000 chars]');
+
+    expect(getExpandedText).toHaveBeenCalled();
+    expect(host.updateGoalLengthWarning).toHaveBeenCalledWith(expanded);
+  });
+
+  it('expands a paste that can complete a partially typed /goal command', () => {
+    const { host, editor } = createHarness();
+    const expanded = `/goal ${'x'.repeat(4001)}`;
+    const getExpandedText = installExpandedText(editor, expanded);
+    const onChange = editor['onChange'] as unknown as (text: string) => void;
+
+    // Visible text is `/go[paste #1 …]`; the paste completes the command.
+    onChange('/go[paste #1 +3999 chars]');
+
+    expect(getExpandedText).toHaveBeenCalled();
+    expect(host.updateGoalLengthWarning).toHaveBeenCalledWith(expanded);
+  });
+
+  it('skips paste expansion entirely for non-goal input', () => {
+    const { host, editor } = createHarness();
+    const getExpandedText = installExpandedText(editor, 'whatever');
+    const onChange = editor['onChange'] as unknown as (text: string) => void;
+
+    onChange('just a normal prompt');
+    onChange('/help');
+
+    expect(getExpandedText).not.toHaveBeenCalled();
+    expect(host.updateGoalLengthWarning).toHaveBeenCalledWith(undefined);
+  });
+
+  it('gates on trimmed text because submit trims leading whitespace', () => {
+    const { host, editor } = createHarness();
+    const expanded = `/goal ${'x'.repeat(4001)}`;
+    const getExpandedText = installExpandedText(editor, expanded);
+    const onChange = editor['onChange'] as unknown as (text: string) => void;
+
+    onChange(`  /goal ${'x'.repeat(4001)}`);
+
+    expect(getExpandedText).toHaveBeenCalled();
+    expect(host.updateGoalLengthWarning).toHaveBeenCalledWith(expanded);
+  });
+
+  it('skips the goal length warning in bash mode', () => {
+    const { host, editor } = createHarness();
+    const getExpandedText = installExpandedText(editor, '/goal x');
+    (editor as unknown as { inputMode: string }).inputMode = 'bash';
+    const onChange = editor['onChange'] as unknown as (text: string) => void;
+
+    onChange('/goal x');
+
+    expect(getExpandedText).not.toHaveBeenCalled();
+    expect(host.updateGoalLengthWarning).toHaveBeenCalledWith(undefined);
+  });
+});
+
+describe('EditorKeyboardController Shift-Tab plan toggle', () => {
+  function createShiftTabHarness(options: { sessionless?: boolean; engineV2?: boolean } = {}) {
+    const editor: Record<string, ((...args: never[]) => unknown) | undefined> = {
+      setHistoryFilter: vi.fn() as unknown as (...args: never[]) => unknown,
+    };
+    const handlePlanToggle = vi.fn();
+    const track = vi.fn();
+    const showError = vi.fn();
+    const ensureSession = vi.fn(async (): Promise<{ id: string } | undefined> => ({ id: 'ses-lazy' }));
+    const host = {
+      state: {
+        editor,
+        activeDialog: null,
+        appState: { streamingPhase: 'idle', isCompacting: false, planMode: false },
+        footer: { setTransientHint: vi.fn() },
+        ui: { requestRender: vi.fn() },
+      },
+      session: options.sessionless ? undefined : { cancel: vi.fn(async () => {}) },
+      engineV2: options.engineV2 ?? false,
+      ensureSession,
+      handlePlanToggle,
+      track,
+      showError,
+      btwPanelController: { cancelRunning: vi.fn(), closeOrCancel: vi.fn() },
+    } as unknown as EditorKeyboardHost;
+
+    new EditorKeyboardController(host, undefined as unknown as ImageAttachmentStore).install();
+    const onShiftTab = editor['onShiftTab'] as unknown as () => void;
+    return { onShiftTab, handlePlanToggle, track, showError, ensureSession };
+  }
+
+  it('toggles plan mode directly with an active session', () => {
+    const { onShiftTab, handlePlanToggle, ensureSession } = createShiftTabHarness();
+
+    onShiftTab();
+
+    expect(ensureSession).not.toHaveBeenCalled();
+    expect(handlePlanToggle).toHaveBeenCalledWith(true);
+  });
+
+  it('reports no active session on v1 when session-less', () => {
+    const { onShiftTab, showError, handlePlanToggle } = createShiftTabHarness({
+      sessionless: true,
+    });
+
+    onShiftTab();
+
+    expect(showError).toHaveBeenCalledWith(NO_ACTIVE_SESSION_MESSAGE);
+    expect(handlePlanToggle).not.toHaveBeenCalled();
+  });
+
+  it('lazy-creates the session before toggling on v2 when session-less', async () => {
+    const { onShiftTab, ensureSession, handlePlanToggle, track } = createShiftTabHarness({
+      sessionless: true,
+      engineV2: true,
+    });
+
+    onShiftTab();
+    expect(handlePlanToggle).not.toHaveBeenCalled();
+
+    await vi.waitFor(() => {
+      expect(handlePlanToggle).toHaveBeenCalledWith(true);
+    });
+    expect(ensureSession).toHaveBeenCalledOnce();
+    expect(track).toHaveBeenCalledWith('shortcut_plan_toggle', { enabled: true });
+  });
+
+  it('does not toggle when the lazy creation fails on v2', async () => {
+    const { onShiftTab, ensureSession, handlePlanToggle } = createShiftTabHarness({
+      sessionless: true,
+      engineV2: true,
+    });
+    ensureSession.mockResolvedValue(undefined);
+
+    onShiftTab();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(handlePlanToggle).not.toHaveBeenCalled();
+  });
+});
+
+
+/**
+ * Ctrl-S steering of the TUI queue: plain-text items steer as messages,
+ * slash-skill items fire as real activations into the running turn (never as
+ * literal text), bash items stay queued — all in queue order.
+ */
+describe('EditorKeyboardController Ctrl-S steering', () => {
+  it('steers text as a message, skill items as activations, and keeps bash queued', () => {
+    const editor: Record<string, ((...args: never[]) => unknown) | undefined> = {
+      setHistoryFilter: vi.fn() as unknown as (...args: never[]) => unknown,
+      setInputMode: vi.fn() as unknown as (...args: never[]) => unknown,
+      getText: vi.fn(() => '') as unknown as (...args: never[]) => unknown,
+      setText: vi.fn() as unknown as (...args: never[]) => unknown,
+      inputMode: 'prompt' as unknown as (...args: never[]) => unknown,
+    };
+    const steerMessage = vi.fn();
+    const steerSkillActivation = vi.fn();
+    const updateQueueDisplay = vi.fn();
+    const session = { id: 'ses-1' };
+    const host = {
+      state: {
+        editor,
+        queuedMessages: [
+          { text: 'queued text', agentId: 'main' },
+          { text: '/tower status', agentId: 'main', mode: 'skill', skillName: 'tower', skillArgs: 'status' },
+          { text: '!ls', agentId: 'main', mode: 'bash' },
+        ],
+        appState: {
+          streamingPhase: 'waiting',
+          isCompacting: false,
+          model: 'mock-model',
+        },
+        ui: { requestRender: vi.fn() },
+      },
+      session,
+      steerMessage,
+      steerSkillActivation,
+      updateQueueDisplay,
+      validateMediaCapabilities: vi.fn(() => true),
+      showError: vi.fn(),
+      track: vi.fn(),
+    } as unknown as EditorKeyboardHost;
+
+    const controller = new EditorKeyboardController(
+      host,
+      undefined as unknown as ImageAttachmentStore,
+    );
+    controller.install();
+
+    const handler = editor['onCtrlS'];
+    expect(handler).toBeDefined();
+    (handler as () => void)();
+
+    expect(steerMessage).toHaveBeenCalledWith(session, [
+      { text: 'queued text', parts: undefined, imageAttachmentIds: undefined },
+    ]);
+    expect(steerSkillActivation).toHaveBeenCalledWith(session, 'tower', 'status');
+    expect(host.state.queuedMessages).toEqual([{ text: '!ls', agentId: 'main', mode: 'bash' }]);
+    expect(updateQueueDisplay).toHaveBeenCalled();
   });
 });

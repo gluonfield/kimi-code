@@ -9,7 +9,8 @@
  * folder picker, the session filesystem, terminals, connections, shutdown).
  */
 
-import type { Scope } from '@moonshot-ai/agent-core-v2';
+import { IConfigService, type Scope } from '@moonshot-ai/agent-core-v2';
+import { IFlagService } from '@moonshot-ai/agent-core-v2/app/flag/flag';
 import type { KimiHostIdentity } from '@moonshot-ai/kimi-code-oauth';
 import { ulid } from 'ulid';
 
@@ -19,6 +20,7 @@ import { type SessionEventBroadcaster } from '../transport/ws/v1/sessionEventBro
 import type { TranscriptService } from '../services/transcript/transcriptService';
 import { registerApprovalsRoutes } from './approvals';
 import { registerAuthRoute } from './auth';
+import { registerCapabilitiesRoutes } from './capabilities';
 import { registerConfigRoutes } from './config';
 import { registerConnectionsRoutes } from './connections';
 import { registerFilesRoutes } from './files';
@@ -26,11 +28,11 @@ import { registerFsRoutes } from './fs';
 import { registerGuiStoreRoutes } from './guiStore';
 import { registerMessagesRoutes } from './messages';
 import type { IGuiStoreService } from '../services/guiStore/guiStore';
-import type { ISnapshotReader } from '../services/snapshot';
 import { registerDebugRoutes } from '../transport/registerDebugRoutes';
 import { registerMetaRoute } from './meta';
 import { registerModelCatalogRoutes } from './modelCatalog';
 import { registerOAuthRoutes } from './oauth';
+import { registerPluginsRoutes } from './plugins';
 import { registerPromptsRoutes } from './prompts';
 import { registerQuestionsRoutes } from './questions';
 import { registerSearchRoutes } from './search';
@@ -75,8 +77,11 @@ export interface RegisterApiV1RoutesOptions {
   readonly onShutdown: () => void;
   readonly connectionRegistry: IConnectionRegistry;
   readonly broadcaster: SessionEventBroadcaster;
-  readonly snapshotReader: ISnapshotReader;
   readonly transcriptService: TranscriptService;
+  /** Catalog URL for the `/plugins/marketplace` route (resolved by start.ts). */
+  readonly pluginMarketplaceUrl: string;
+  /** True when the catalog URL is the built-in default (no option/env set). */
+  readonly pluginMarketplaceIsDefault: boolean;
   /**
    * Surface `dangerous_bypass_auth` in the `/meta` payload. Set by `start.ts`
    * from the `disableAuth` server option (the `--dangerous-bypass-auth` CLI
@@ -105,6 +110,15 @@ export async function registerApiV1Routes(
         serverId: ulid(),
         startedAt: new Date().toISOString(),
         dangerousBypassAuth: opts.dangerousBypassAuth === true,
+        getExperimentalFlags: async () => {
+          // Same edge-facade contract as the config route: never project
+          // config-derived state before the initial load settles — an early
+          // /meta hit would otherwise advertise default/env-only flags and
+          // hide config-enabled features until the FlagService's change
+          // watcher catches up.
+          await core.accessor.get(IConfigService).ready;
+          return core.accessor.get(IFlagService).snapshot();
+        },
       });
 
       registerAuthRoute(apiV1 as unknown as Parameters<typeof registerAuthRoute>[0], core);
@@ -124,6 +138,14 @@ export async function registerApiV1Routes(
         { hostIdentity: opts.hostIdentity },
       );
       registerSkillsRoutes(apiV1 as unknown as Parameters<typeof registerSkillsRoutes>[0], core);
+      registerCapabilitiesRoutes(
+        apiV1 as unknown as Parameters<typeof registerCapabilitiesRoutes>[0],
+        core,
+      );
+      registerPluginsRoutes(apiV1 as unknown as Parameters<typeof registerPluginsRoutes>[0], core, {
+        marketplaceUrl: opts.pluginMarketplaceUrl,
+        marketplaceIsDefault: opts.pluginMarketplaceIsDefault,
+      });
       registerMessagesRoutes(
         apiV1 as unknown as Parameters<typeof registerMessagesRoutes>[0],
         core,
@@ -167,7 +189,6 @@ export async function registerApiV1Routes(
       registerSnapshotRoutes(apiV1 as unknown as Parameters<typeof registerSnapshotRoutes>[0], {
         core,
         broadcaster: opts.broadcaster,
-        reader: opts.snapshotReader,
       });
       registerTranscriptRoutes(apiV1 as unknown as Parameters<typeof registerTranscriptRoutes>[0], {
         core,

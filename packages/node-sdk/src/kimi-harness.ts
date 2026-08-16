@@ -7,27 +7,36 @@ import {
   type ExperimentalFeatureState,
 } from '@moonshot-ai/agent-core';
 
-import { Session } from '#/session';
+import { capabilityRpc, Session } from '#/session';
 import type { KimiAuthFacade } from '#/auth';
 import type { SDKRpcClientBase } from '#/rpc';
 import type {
   AuthenticateMcpServerOptions,
+  CapabilityStatus,
   ConfigDiagnostics,
   CreateSessionOptions,
   ExportSessionInput,
   ExportSessionResult,
   ForkSessionInput,
+  GenerateSessionTitleInput,
   GetConfigOptions,
+  GlobalMcpServerAuthStatus,
   KimiConfig,
   KimiConfigPatch,
   KimiHostIdentity,
   ListSessionsOptions,
   McpServerConfig,
+  McpServerInfo,
   McpTestResult,
+  PluginCommandDef,
+  PluginInfo,
+  PluginSummary,
+  ReloadSummary,
   RenameSessionInput,
   ResumeSessionInput,
   ReloadSessionInput,
   SessionSummary,
+  SessionSummaryPage,
   SkillSummary,
   TelemetryClient,
   TelemetryContextPatch,
@@ -64,6 +73,7 @@ export class KimiHarness {
   private readonly uiMode: string;
   private readonly telemetry: TelemetryClient;
   private readonly activeSessions = new Map<string, Session>();
+  private readonly resumeInflight = new Map<string, Promise<Session>>();
   private readonly ensureConfigFileImpl: () => Promise<void>;
   private readonly closeImpl: () => void | Promise<void>;
   private readonly sessionStartedProperties: TelemetryProperties;
@@ -122,7 +132,9 @@ export class KimiHarness {
       summary,
       rpc: this.rpc,
       onClose: () => {
-        this.activeSessions.delete(summary.id);
+        if (this.activeSessions.get(summary.id) === session) {
+          this.activeSessions.delete(summary.id);
+        }
       },
     });
     this.activeSessions.set(session.id, session);
@@ -137,8 +149,16 @@ export class KimiHarness {
   async resumeSession(input: ResumeSessionInput): Promise<Session> {
     const id = normalizeSessionId(input.id);
     const active = this.activeSessions.get(id);
-    const { kaos, persistenceKaos, sessionStartedProperties, ...resumeInput } = input;
-    if (active !== undefined) {
+    const {
+      kaos,
+      persistenceKaos,
+      sessionStartedProperties: _sessionStartedProperties,
+      ...resumeInput
+    } = input;
+    // A session whose close is in flight (`isClosed` but not yet unmapped)
+    // is not a valid resume target — fall through and re-resume fresh, which
+    // the engine serializes behind that close.
+    if (active !== undefined && !active.isClosed) {
       if (kaos !== undefined || persistenceKaos !== undefined) {
         await this.rpc.resumeSessionWithKaos({ ...resumeInput, id }, kaos ?? persistenceKaos as Kaos, persistenceKaos);
       } else if (input.agentProfile !== undefined) {
@@ -147,6 +167,26 @@ export class KimiHarness {
       return active;
     }
 
+    // Coalesce concurrent resumes of the same id onto one facade, keyed by
+    // the full input so a caller with different options (dirs, replay,
+    // profile, kaos) never has them silently dropped; without this,
+    // parallel identical callers each build their own Session over the
+    // shared engine handle, and one facade's close kills the engine handle
+    // under the other.
+    const key = resumeCoalesceKey(id, input);
+    const inflight = this.resumeInflight.get(key);
+    if (inflight !== undefined) return inflight;
+    const run = this.doResumeSession(input, id);
+    this.resumeInflight.set(key, run);
+    try {
+      return await run;
+    } finally {
+      if (this.resumeInflight.get(key) === run) this.resumeInflight.delete(key);
+    }
+  }
+
+  private async doResumeSession(input: ResumeSessionInput, id: string): Promise<Session> {
+    const { kaos, persistenceKaos, sessionStartedProperties, ...resumeInput } = input;
     const summary =
       kaos === undefined && persistenceKaos === undefined
         ? await this.rpc.resumeSession({ ...resumeInput, id })
@@ -157,7 +197,9 @@ export class KimiHarness {
       summary,
       rpc: this.rpc,
       onClose: () => {
-        this.activeSessions.delete(summary.id);
+        if (this.activeSessions.get(summary.id) === session) {
+          this.activeSessions.delete(summary.id);
+        }
       },
     });
     this.activeSessions.set(session.id, session);
@@ -187,7 +229,9 @@ export class KimiHarness {
       summary,
       rpc: this.rpc,
       onClose: () => {
-        this.activeSessions.delete(summary.id);
+        if (this.activeSessions.get(summary.id) === session) {
+          this.activeSessions.delete(summary.id);
+        }
       },
     });
     this.activeSessions.set(session.id, session);
@@ -210,7 +254,9 @@ export class KimiHarness {
       summary,
       rpc: this.rpc,
       onClose: () => {
-        this.activeSessions.delete(summary.id);
+        if (this.activeSessions.get(summary.id) === session) {
+          this.activeSessions.delete(summary.id);
+        }
       },
     });
     this.activeSessions.set(session.id, session);
@@ -235,7 +281,18 @@ export class KimiHarness {
 
   async renameSession(input: RenameSessionInput): Promise<void> {
     await this.rpc.renameSession(input);
-    this.activeSessions.get(input.id)?.emitMetaUpdated({ title: input.title });
+    this.activeSessions
+      .get(input.id)
+      ?.emitMetaUpdated({ title: input.title, isCustomTitle: true });
+  }
+
+  /**
+   * Generate and apply a session title from the main agent's first prompts
+   * (v2 engine only). Resolves to `undefined` when generation is unavailable
+   * and the current title is kept.
+   */
+  async generateSessionTitle(input: GenerateSessionTitleInput): Promise<string | undefined> {
+    return this.rpc.generateSessionTitle(input);
   }
 
   async exportSession(input: ExportSessionInput): Promise<ExportSessionResult> {
@@ -251,9 +308,87 @@ export class KimiHarness {
     return this.rpc.listSessions(options);
   }
 
+  /**
+   * One keyset page of the session listing (`limit` / `before` in
+   * `ListSessionsOptions`). Paged on the v2 engine; the v1 engine serves the
+   * whole filtered set as a single terminal page.
+   */
+  async listSessionsPage(options: ListSessionsOptions = {}): Promise<SessionSummaryPage> {
+    return this.rpc.listSessionsPage(options);
+  }
+
   /** Skills visible to a new session in `workDir`, without creating that session. */
   async listWorkspaceSkills(workDir: string): Promise<readonly SkillSummary[]> {
     return this.rpc.listWorkspaceSkills(workDir);
+  }
+
+  /**
+   * App-global plugin command list, no session required. Empty on the v1
+   * engine, which only exposes plugin commands through a live session.
+   */
+  async listPluginCommands(): Promise<readonly PluginCommandDef[]> {
+    return this.rpc.listPluginCommandsGlobal();
+  }
+
+  /**
+   * App-global plugin management, no session required. The v2 engine keeps
+   * plugin state app-global (these calls are routed through the klient
+   * `global.plugins` facade), so `/plugins` works before the first session
+   * exists; the v1 engine only exposes plugins through a live session.
+   */
+  async listPlugins(): Promise<readonly PluginSummary[]> {
+    return this.rpc.listPlugins();
+  }
+
+  /**
+   * Workspace-level MCP server list, no session required. The v2 engine owns
+   * one shared connection set per workspace handler, so `/mcp` is inspectable
+   * before the first session exists; empty on the v1 engine.
+   */
+  async listWorkspaceMcpServers(workDir: string): Promise<readonly McpServerInfo[]> {
+    return this.rpc.listWorkspaceMcpServers(workDir);
+  }
+
+  async installPlugin(source: string): Promise<PluginSummary> {
+    return this.rpc.installPlugin(source);
+  }
+
+  async setPluginEnabled(id: string, enabled: boolean): Promise<void> {
+    return this.rpc.setPluginEnabled(id, enabled);
+  }
+
+  async setPluginMcpServerEnabled(id: string, server: string, enabled: boolean): Promise<void> {
+    return this.rpc.setPluginMcpServerEnabled(id, server, enabled);
+  }
+
+  async removePlugin(id: string): Promise<void> {
+    return this.rpc.removePlugin(id);
+  }
+
+  async reloadPlugins(): Promise<ReloadSummary> {
+    return this.rpc.reloadPlugins();
+  }
+
+  async getPluginInfo(id: string): Promise<PluginInfo> {
+    return this.rpc.getPluginInfo(id);
+  }
+
+  /**
+   * App-global capability readiness and setup (the built-in product
+   * capabilities kimi-cu / kimi-webbridge), no session required. Routed
+   * through the same global channel as session capability calls; requires
+   * the v2 engine and throws on v1, which has no capability surface.
+   */
+  async listCapabilities(): Promise<readonly CapabilityStatus[]> {
+    return capabilityRpc(this.rpc).listCapabilities();
+  }
+
+  async getCapability(id: string): Promise<CapabilityStatus> {
+    return capabilityRpc(this.rpc).getCapability(id);
+  }
+
+  async installCapability(id: string): Promise<CapabilityStatus> {
+    return capabilityRpc(this.rpc).installCapability(id);
   }
 
   /**
@@ -316,6 +451,10 @@ export class KimiHarness {
   /** User-global MCP entries from `<KIMI_CODE_HOME>/mcp.json` only. */
   async listMcpServers(): Promise<readonly McpServerConfig[]> {
     return this.rpc.listGlobalMcpServers();
+  }
+
+  async listMcpServerAuthStatuses(): Promise<readonly GlobalMcpServerAuthStatus[]> {
+    return this.rpc.listGlobalMcpServerAuthStatuses();
   }
 
   async addMcpServer(server: McpServerConfig): Promise<readonly McpServerConfig[]> {
@@ -395,6 +534,16 @@ export class KimiHarness {
 }
 
 const DEFAULT_SESSION_STARTED_UI_MODE = 'shell';
+
+function resumeCoalesceKey(id: string, input: ResumeSessionInput): string {
+  const { kaos, persistenceKaos, ...rest } = input;
+  return JSON.stringify({
+    ...rest,
+    id,
+    kaos: kaos !== undefined,
+    persistenceKaos: persistenceKaos !== undefined,
+  });
+}
 
 function normalizeSessionId(value: string): string {
   if (typeof value !== 'string') {

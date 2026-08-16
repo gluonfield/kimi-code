@@ -26,7 +26,7 @@ import {
 import { AgentContextProjectorService } from '#/agent/contextProjector/contextProjectorService';
 import { AgentLLMRequesterService } from '#/agent/llmRequester/llmRequesterService';
 import { IAgentLLMRequesterService } from '#/agent/llmRequester/llmRequester';
-import { IAgentContextSizeService } from '#/agent/contextSize/contextSize';
+import { IAgentTokenCountingService } from '#/agent/tokenCounting/tokenCounting';
 import { IAgentProfileService } from '#/agent/profile/profile';
 import { IAgentStateService } from '#/agent/state/agentState';
 import { AgentStateService } from '#/agent/state/agentStateService';
@@ -42,8 +42,13 @@ import {
   APIRequestTooLargeError,
   APIStatusError,
 } from '#/kosong/contract/errors';
-import { emptyUsage } from '#/kosong/contract/usage';
-import type { Message } from '#/kosong/contract/message';
+import { emptyUsage, type TokenUsage } from '#/kosong/contract/usage';
+import {
+  isToolCall,
+  type Message,
+  type StreamedMessagePart,
+  type ToolCall,
+} from '#/kosong/contract/message';
 import type { ThinkingEffort } from '#/kosong/contract/provider';
 import type { ModelCapability } from '#/kosong/contract/capability';
 import { IModelCatalog, type Model } from '#/kosong/model/catalog';
@@ -141,6 +146,7 @@ function createService(
     | undefined,
   options: {
     readonly thinkingLevel?: ThinkingEffort;
+    readonly contextMessages?: Message[];
   } = {},
 ) {
   const ix = disposables.add(new TestInstantiationService());
@@ -165,12 +171,15 @@ function createService(
       systemPrompt: 'system',
     }),
   };
-  const contextSize = {
+  const measuredCalls: { readonly messages: number; readonly usage: TokenUsage }[] = [];
+  const tokenCounting = {
     get: () => ({ size: 0, measured: 0, estimated: 0 }),
-    measured: () => undefined,
+    measured: (input: readonly Message[], _output: readonly Message[], usage: TokenUsage) => {
+      measuredCalls.push({ messages: input.length, usage });
+    },
   };
   const usage = { record: () => undefined, status: () => ({}) };
-  const context = { get: () => history };
+  const context = { get: () => options.contextMessages ?? history };
   const tools = { list: () => [] };
   const config: Partial<IConfigService> = {
     get: (() => undefined) as IConfigService['get'],
@@ -207,7 +216,7 @@ function createService(
       ...projector,
     });
   }
-  ix.stub(IAgentContextSizeService, contextSize);
+  ix.stub(IAgentTokenCountingService, tokenCounting);
   ix.stub(IAgentToolRegistryService, tools);
   ix.stub(IAgentProfileService, profile);
   ix.stub(IAgentUsageService, usage);
@@ -237,8 +246,38 @@ function createService(
     records,
     events,
     telemetryRecords,
+    measuredCalls,
   };
 }
+
+describe('AgentLLMRequesterService measured anchors', () => {
+  it('skips the measured anchor when the stream reports no usage', async () => {
+    const { service, measuredCalls } = createService(createRequester({ value: 0 }), undefined);
+
+    await service.request();
+
+    expect(measuredCalls).toHaveLength(0);
+  });
+
+  it('writes the measured anchor from the reported usage', async () => {
+    const requester = createRequester({ value: 0 });
+    const base = requester.request.bind(requester);
+    requester.request = async function* (input, signal, options) {
+      yield {
+        type: 'usage',
+        usage: { inputOther: 40, output: 2, inputCacheRead: 0, inputCacheCreation: 0 },
+        model: 'wire-model',
+      };
+      yield* base(input, signal, options);
+    };
+    const { service, measuredCalls } = createService(requester, undefined);
+
+    await service.request();
+
+    expect(measuredCalls).toHaveLength(1);
+    expect(measuredCalls[0]?.usage.inputOther).toBe(40);
+  });
+});
 
 describe('AgentLLMRequesterService Anthropic effort diagnostics', () => {
   it('warns and sends when the effort is not listed by the model', async () => {
@@ -718,9 +757,6 @@ describe('AgentLLMRequesterService trace id', () => {
   });
 
   it('keeps the header-captured trace when the request fails after headers arrived', async () => {
-    // A failure after the response headers arrived (empty response, mid-stream
-    // decode error) carries no trace on the error itself; the trace captured
-    // through the provider callback must remain on the request trace.
     const requester = createTracedRequester(null);
     Object.defineProperty(requester, 'request', {
       value: async function* (...args: unknown[]) {
@@ -769,5 +805,132 @@ describe('AgentLLMRequesterService trace id', () => {
     expect(
       telemetryRecords.find((record) => record.event === 'api_error')?.properties?.['trace_id'],
     ).toBeUndefined();
+  });
+});
+
+describe('AgentLLMRequesterService tool call id normalization', () => {
+  function createScriptedRequester(
+    script: { ids: string[]; error?: Error }[],
+  ): ModelRequester {
+    const base = createRequester({ value: 0 });
+    let callIndex = 0;
+    return {
+      model: base.model,
+      request: async function* () {
+        const step = script[Math.min(callIndex++, script.length - 1)]!;
+        if (step.error !== undefined) {
+          if (step.ids.length > 0) {
+            yield {
+              type: 'part',
+              part: {
+                type: 'function',
+                id: step.ids[0]!,
+                name: 'Bash',
+                arguments: null,
+                _streamIndex: 0,
+              },
+            } satisfies ModelRequestEvent;
+          }
+          throw step.error;
+        }
+        const toolCalls: ToolCall[] = [];
+        for (const [index, id] of step.ids.entries()) {
+          yield {
+            type: 'part',
+            part: { type: 'function', id, name: 'Bash', arguments: null, _streamIndex: index },
+          } satisfies ModelRequestEvent;
+          yield {
+            type: 'part',
+            part: { type: 'tool_call_part', argumentsPart: '{"command":"ls"}', index },
+          } satisfies ModelRequestEvent;
+          toolCalls.push({ type: 'function', id, name: 'Bash', arguments: '{"command":"ls"}' });
+        }
+        yield {
+          type: 'finish',
+          message: { role: 'assistant', content: [], toolCalls },
+          providerFinishReason: 'completed',
+          rawFinishReason: 'stop',
+          id: 'resp-1',
+        } satisfies ModelRequestEvent;
+      },
+    };
+  }
+
+  it('passes provider-unique ids through unchanged', async () => {
+    const parts: StreamedMessagePart[] = [];
+    const { service } = createService(
+      createScriptedRequester([{ ids: ['call_1', 'call_2'] }]),
+      undefined,
+    );
+
+    const result = await service.request({}, (part) => {
+      parts.push(part);
+    });
+
+    expect(result.message.toolCalls.map((c) => c.id)).toEqual(['call_1', 'call_2']);
+    expect(parts.filter(isToolCall).map((p) => p.id)).toEqual(['call_1', 'call_2']);
+  });
+
+  it('rewrites an id repeated across responses and keeps streamed parts consistent', async () => {
+    const parts: StreamedMessagePart[] = [];
+    const { service } = createService(
+      createScriptedRequester([{ ids: ['Bash_0'] }, { ids: ['Bash_0'] }]),
+      undefined,
+    );
+
+    const first = await service.request({}, (part) => {
+      parts.push(part);
+    });
+    const second = await service.request({}, (part) => {
+      parts.push(part);
+    });
+
+    expect(first.message.toolCalls[0]!.id).toBe('Bash_0');
+    expect(second.message.toolCalls[0]!.id).toBe('Bash_0__2');
+    expect(parts.filter(isToolCall).map((p) => p.id)).toEqual(['Bash_0', 'Bash_0__2']);
+  });
+
+  it('rewrites duplicates within a single response', async () => {
+    const { service } = createService(
+      createScriptedRequester([{ ids: ['Bash_0', 'Bash_0'] }]),
+      undefined,
+    );
+
+    const result = await service.request();
+
+    expect(result.message.toolCalls.map((c) => c.id)).toEqual(['Bash_0', 'Bash_0__2']);
+  });
+
+  it('rolls claims back when the attempt fails mid-stream', async () => {
+    const { service } = createService(
+      createScriptedRequester([
+        { ids: ['Bash_9'], error: new Error('stream boom') },
+        { ids: ['Bash_9'] },
+      ]),
+      undefined,
+    );
+
+    await expect(service.request()).rejects.toThrow('stream boom');
+    const retry = await service.request();
+    expect(retry.message.toolCalls[0]!.id).toBe('Bash_9');
+  });
+
+  it('rewrites an id that already exists in the restored context', async () => {
+    const { service } = createService(
+      createScriptedRequester([{ ids: ['Bash_0'] }]),
+      undefined,
+      {
+        contextMessages: [
+          {
+            role: 'assistant',
+            content: [],
+            toolCalls: [{ type: 'function', id: 'Bash_0', name: 'Bash', arguments: '{}' }],
+          },
+        ],
+      },
+    );
+
+    const result = await service.request();
+    expect(result.message.toolCalls[0]!.id).toBe('Bash_0__2');
   });
 });

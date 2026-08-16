@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-
+import { LifecycleScope } from '#/app/scopes';
 import {
-  LifecycleScope,
   ScopeActivation,
   _clearScopedRegistryForTests,
   registerScopedService,
@@ -51,6 +50,52 @@ describe('StateRegistry', () => {
     const registry = new StateRegistry();
     registry.register(countKey);
     expect(() => registry.register(countKey)).toThrow(BugIndicatingError);
+  });
+
+  it('removes the key and value when its registration is disposed', () => {
+    const registry = new StateRegistry();
+    const registration = registry.register(countKey);
+    registry.set(countKey, 42);
+
+    registration.dispose();
+
+    expect(registry.has(countKey)).toBe(false);
+    expect(registry.entries()).toEqual([]);
+    expect(() => registry.get(countKey)).toThrow(BugIndicatingError);
+    expect(() => registry.set(countKey, 1)).toThrow(BugIndicatingError);
+  });
+
+  it('re-registers with the initial value and ignores stale disposal', () => {
+    const registry = new StateRegistry();
+    const first = registry.register(countKey);
+    registry.set(countKey, 42);
+    first.dispose();
+
+    const second = registry.register(countKey);
+    expect(registry.get(countKey)).toBe(0);
+
+    first.dispose();
+    expect(registry.has(countKey)).toBe(true);
+    second.dispose();
+    expect(registry.has(countKey)).toBe(false);
+  });
+
+  it('isolates listeners between registrations', () => {
+    const registry = new StateRegistry();
+    const first = registry.register(countKey);
+    const oldSeen: number[] = [];
+    registry.onDidChange(countKey)((value) => oldSeen.push(value));
+    registry.set(countKey, 1);
+    first.dispose();
+
+    const second = registry.register(countKey);
+    const newSeen: number[] = [];
+    registry.onDidChange(countKey)((value) => newSeen.push(value));
+    registry.set(countKey, 2);
+
+    expect(oldSeen).toEqual([1]);
+    expect(newSeen).toEqual([2]);
+    second.dispose();
   });
 
   it('rejects get and set on an unregistered key', () => {
@@ -143,8 +188,6 @@ describe('StateRegistry', () => {
     class FakeService {
       constructor(readonly dep: object) {}
     }
-    // A resource graph reachable from plain data: plain -> class -> plain…
-    // The class boundary stops the walk, so the deep plain tail never copied.
     const service = new FakeService({ deep: { tail: 'unreachable' } });
     const mixedKey = defineState('test.mixed', () => ({
       plain: { nested: [1, { ok: true }] },

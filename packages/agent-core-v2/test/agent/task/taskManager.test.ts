@@ -85,6 +85,7 @@ function agentTask(
   options: {
     readonly agentId?: string;
     readonly subagentType?: string;
+    readonly parentToolCallId?: string;
     readonly abortController?: AbortController;
     readonly timeoutMs?: number;
   } = {},
@@ -92,6 +93,7 @@ function agentTask(
   const handle: SubagentHandle = {
     agentId: options.agentId ?? 'agent-child',
     profileName: options.subagentType ?? 'coder',
+    parentToolCallId: options.parentToolCallId,
     completion,
   };
   const task = new SubagentTask(
@@ -410,6 +412,7 @@ describe('AgentTaskService', () => {
       agentTask(new Promise(() => {}), 'investigate bug', {
         agentId: 'agent-child',
         subagentType: 'coder',
+        parentToolCallId: 'call-parent-1',
       }),
     );
 
@@ -420,6 +423,7 @@ describe('AgentTaskService', () => {
       description: 'investigate bug',
       agentId: 'agent-child',
       subagentType: 'coder',
+      parentToolCallId: 'call-parent-1',
       status: 'running',
     });
   });
@@ -1282,10 +1286,6 @@ describe('AgentTaskService', () => {
       expect(manager.getTask('bash-bogusss0')).toBeUndefined();
 
       expect(await persistence!.listTasks()).toEqual([]);
-      // The session scope's initial metadata write is kicked at creation but
-      // not awaited by the (synchronous) harness; settle it before the
-      // cleanup below removes the home dir, the same way session
-      // materialization awaits metadata readiness in production.
       await ctx.get(ISessionMetadata).ready;
     } finally {
       await rm(sessionDir, { recursive: true, force: true });

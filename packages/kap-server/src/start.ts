@@ -9,13 +9,23 @@
 
 import {
   bootstrap,
+  drainQueryStoreDisposals,
+  drainSessionMetadataWrites,
+  drainSessionIndexMirror,
   IConfigService,
+  IEventService,
   IProviderDiscoveryService,
+  ISessionIndex,
+  ISessionIndexMirror,
+  ICapabilityService,
+  IPluginService,
   IWorkspaceService,
+  KIMI_CODE_PLUGIN_MARKETPLACE_URL,
   logSeed,
   resolveConfigPath,
   resolveKimiHome,
   resolveLoggingConfig,
+  type ConfigDiagnostic,
   type Scope,
   type ScopeSeed,
 } from '@moonshot-ai/agent-core-v2';
@@ -32,6 +42,7 @@ import { transformOpenApiDocument } from './openapi/transforms';
 import { registerRequestLogging } from './requestLogging';
 import { resolveRequestId } from './request-id';
 import { registerApiV1Routes } from './routes/registerApiV1Routes';
+import { registerApiV2Routes } from './routes/registerApiV2Routes';
 import { registerWebAssetRoutes } from './routes/webAssets';
 import {
   createServerLogger,
@@ -49,6 +60,7 @@ import {
 } from './transport/ws/connectionRegistry';
 import { extractWsBearerToken } from './transport/ws/bearerProtocol';
 import { SessionEventBroadcaster } from './transport/ws/v1/sessionEventBroadcaster';
+import type { ConfigWarningItem } from './transport/ws/v1/events';
 import { FsWatchBridge } from './transport/ws/v1/fsWatchBridge';
 import { registerWsV1, WS_PATH as WS_PATH_V1 } from './transport/ws/v1/registerWsV1';
 import { getServerVersion } from './version';
@@ -62,7 +74,6 @@ import { createOriginHook, isOriginAllowed, parseCorsOrigins } from './middlewar
 import { createSecurityHeadersHook } from './middleware/securityHeaders';
 import { createAuthHook } from './middleware/auth';
 import { GuiStoreService } from './services/guiStore/guiStoreService';
-import { loadSnapshotConfig, SnapshotReader } from './services/snapshot';
 import {
   initializeServerTelemetry,
   type ServerTelemetry,
@@ -96,6 +107,12 @@ export interface ServerStartOptions {
   readonly host?: string;
   readonly port?: number;
   readonly homeDir?: string;
+  /**
+   * Plugin marketplace catalog URL for `GET /api/v1/plugins/marketplace`.
+   * Defaults to the `KIMI_CODE_PLUGIN_MARKETPLACE_URL` env var, then the
+   * production catalog.
+   */
+  readonly pluginMarketplaceUrl?: string;
   readonly configPath?: string;
   /**
    * Override the instance-registry directory — used in tests that need the
@@ -306,6 +323,20 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
     );
   }
 
+  // Prepare the session read model before serving traffic (flag-gated; a
+  // no-op when `persistence_minidb_readmodel` is off): opens the query store,
+  // restores the published generation — running the initial projection when
+  // none exists — and starts background reconciliation, so the first request
+  // never pays the open/rebuild cost.
+  try {
+    await core.accessor.get(ISessionIndex).prepare();
+  } catch (error) {
+    logger.warn(
+      { err: error instanceof Error ? error.message : String(error) },
+      'session index prepare failed; falling back to on-demand reads',
+    );
+  }
+
   const app = Fastify({
     loggerInstance: logger,
     // Fastify's default access log records `res.statusCode`, but every
@@ -351,6 +382,9 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
 
   const close = async (): Promise<void> => {
     await app.close();
+    configWarningSubscription.dispose();
+    pluginChangeSubscription.dispose();
+    capabilityInstallSubscription.dispose();
     authFailureLimiter?.dispose();
     modelCatalogRefreshScheduler.dispose();
     // Telemetry is best-effort and must never prevent core or instance cleanup.
@@ -363,11 +397,23 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
       );
     }
     try {
+      // Settle session metadata writes first: requests have stopped, and a
+      // queued write must land before the mirror flushes its summary and the
+      // scope disposal marks the service disposed.
+      await drainSessionMetadataWrites();
+      // Drain the session-index mirror while the query store is still open:
+      // requests have stopped, so no new summaries arrive and the queue just
+      // needs its final flush to land in the read model.
+      await core.accessor.get(ISessionIndexMirror).drain();
       core.dispose();
-      // `core.dispose()` triggers the search service's synchronous `dispose()`,
-      // whose minidb close is asynchronous — await it before releasing the
-      // instance registration (and before embedding hosts tear down homeDir).
+      // `core.dispose()` runs the mirror's, the search service's and the query
+      // store's synchronous `dispose()`, whose drains/closes are asynchronous —
+      // await them before releasing the instance registration (and before
+      // embedding hosts tear down homeDir).
+      await drainSessionIndexMirror();
       await drainGlobalSearchDisposals();
+      await drainQueryStoreDisposals();
+      await drainSessionMetadataWrites();
     } finally {
       await registration.release();
     }
@@ -387,13 +433,52 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
   });
   const fsWatchBridge = new FsWatchBridge({ core, logger });
 
-  const snapshotReader = new SnapshotReader({
-    homeDir,
-    core,
-    broadcaster,
-    logger,
-    config: loadSnapshotConfig(),
+  // Push config warnings (deprecated keys / env vars in use, invalid sections)
+  // to every WS connection as `event.config.warning` whenever the config
+  // service's warning set changes. The broadcaster fans the DomainEvent out
+  // globally (see `onCoreEvent`); delivery is live-only, so the current set is
+  // also published once config is ready for already-connected clients (an
+  // empty initial set publishes nothing — silence already means no warnings).
+  const configService = core.accessor.get(IConfigService);
+  const publishConfigWarnings = (diagnostics: readonly ConfigDiagnostic[]): void => {
+    const warnings: ConfigWarningItem[] = diagnostics
+      .filter((diagnostic) => diagnostic.severity === 'warning')
+      .map((diagnostic) =>
+        diagnostic.domain === undefined
+          ? { message: diagnostic.message }
+          : { domain: diagnostic.domain, message: diagnostic.message },
+      );
+    core.accessor.get(IEventService).publish({
+      type: 'event.config.warning',
+      payload: { warnings },
+    });
+  };
+  const configWarningSubscription = configService.onDidChangeDiagnostics(publishConfigWarnings);
+
+  // Fan plugin/capability lifecycle facts out as global WS events so every
+  // client (desktop settings, web, CLI) converges without polling: plugin
+  // mutations end in onDidReload; capability installs report every progress
+  // transition through onDidChangeInstall.
+  const pluginService = core.accessor.get(IPluginService);
+  const pluginChangeSubscription = pluginService.onDidReload(() => {
+    core.accessor.get(IEventService).publish({ type: 'event.plugin.changed', payload: {} });
   });
+  const capabilityService = core.accessor.get(ICapabilityService);
+  const capabilityInstallSubscription = capabilityService.onDidChangeInstall((change) => {
+    core.accessor.get(IEventService).publish({
+      type: 'event.capability.changed',
+      payload: { capability_id: change.id, install: change.install },
+    });
+  });
+  void configService.ready
+    .then(() => {
+      if (configService.diagnostics().some((diagnostic) => diagnostic.severity === 'warning')) {
+        publishConfigWarnings(configService.diagnostics());
+      }
+    })
+    .catch(() => {
+      /* config readiness is best-effort; warnings are advisory */
+    });
 
   async function registerOpenApi(): Promise<void> {
     const { default: swagger } = await import('@fastify/swagger');
@@ -411,6 +496,7 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
           { name: 'models', description: 'Configured model aliases' },
           { name: 'providers', description: 'Configured providers' },
           { name: 'sessions', description: 'Session lifecycle' },
+          { name: 'v2-sessions', description: 'Domain-grouped session list query (API v2)' },
           { name: 'workspaces', description: 'Workspace registry + folder picker' },
           { name: 'messages', description: 'Message history' },
           { name: 'search', description: 'Global message search' },
@@ -445,15 +531,28 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
     enableShutdown,
     enableTerminals,
     guiStore,
+    pluginMarketplaceUrl:
+      opts.pluginMarketplaceUrl ??
+      process.env['KIMI_CODE_PLUGIN_MARKETPLACE_URL'] ??
+      KIMI_CODE_PLUGIN_MARKETPLACE_URL,
+    pluginMarketplaceIsDefault:
+      opts.pluginMarketplaceUrl === undefined &&
+      (process.env['KIMI_CODE_PLUGIN_MARKETPLACE_URL'] === undefined ||
+        // The dev marketplace server (scripts/dev.mjs) serves this repo's own
+        // catalog and marks itself — it still counts as the default.
+        process.env['KIMI_CODE_PLUGIN_MARKETPLACE_FROM_DEV_SERVER'] === '1'),
     onShutdown: () => {
       void close().catch((err: unknown) => logger.error({ err }, 'server close failed'));
     },
     connectionRegistry,
     broadcaster,
-    snapshotReader,
     transcriptService,
     dangerousBypassAuth: opts.disableAuth === true,
   });
+
+  // `/api/v2` — same envelope conventions as v1, domain-grouped payloads.
+  // Mounted after v1; the root auth/host/origin hooks cover it identically.
+  await registerApiV2Routes(app, core);
 
   const wssV1 = registerWsV1(core, {
     validateCredential,

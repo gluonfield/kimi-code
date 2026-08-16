@@ -10,23 +10,27 @@
  * envelope while non-empty unversioned logs are rejected. Removal awaits the
  * agent task manager's graceful exit policy before draining turns and full
  * compaction, then disposing the child scope. Fans session-level
- * permission-mode switches out to every live agent. Bound at Session scope.
+ * permission-mode switches out to every live agent — except
+ * `tower-worker`-profile agents, which TowerSpawn pins to `auto` (they run
+ * detached and unattended); the broadcast leaves them on `auto`. Bound at
+ * Session scope.
  *
  * No agent id is special here: the main agent is simply the agent created
  * with the conventional `MAIN_AGENT_ID`, and `fork` requires its source to
- * exist. The workspace's shared MCP
- * manager arrives through the seeded `ISessionMcpHandle`, whose initial
- * connect this service awaits during creation.
+ * exist. MCP readiness is not awaited here: the workspace's shared manager
+ * connects in the background and the agent's LLM steps wait on it instead
+ * (see `AgentMcpService`).
  */
 
 import { IInstantiationService } from '#/_base/di/instantiation';
 import { Disposable, type IDisposable } from '#/_base/di/lifecycle';
 import { Emitter } from '#/_base/event';
+import { Error2, ErrorCodes } from '#/errors';
 import { join } from 'pathe';
+import { LifecycleScope } from '#/app/scopes';
 import {
   createScopedChildHandle,
   type IAgentScopeHandle,
-  LifecycleScope,
   ScopeActivation,
   registerScopedService,
 } from '#/_base/di/scope';
@@ -36,10 +40,11 @@ import { IEventBus } from '#/app/event/eventBus';
 import { DEFAULT_PERMISSION_MODE_SECTION } from '#/agent/permissionMode/configSection';
 import { PermissionModeConfiguredModel } from '#/agent/permissionMode/permissionModeOps';
 import type { PermissionMode } from '#/agent/permissionPolicy/types';
+import { ProfileModel } from '#/agent/profile/profileOps';
+import { TOWER_WORKER_PROFILE } from '#/features/tower/tower';
 import { IAgentTaskService } from '#/agent/task/task';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
-import { ISessionMcpHandle } from '#/session/mcp/sessionMcpHandle';
 import { IAgentScopeContext, makeAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import { IAgentLoopService } from '#/agent/loop/loop';
 import { IAgentProfileService } from '#/agent/profile/profile';
@@ -60,6 +65,7 @@ import {
 
 let nextAgentId = 0;
 
+// NOTE: stays Disposable — its own 'get' and 'config' collide with the Fiber
 export class AgentLifecycleService extends Disposable implements IAgentLifecycleService {
   declare readonly _serviceBrand: undefined;
   private readonly handles = new Map<string, IAgentScopeHandle>();
@@ -81,7 +87,6 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
     @ISessionMetadata private readonly sessionMetadata: ISessionMetadata,
     @IBootstrapService private readonly bootstrap: IBootstrapService,
     @IConfigService private readonly config: IConfigService,
-    @ISessionMcpHandle private readonly mcpHandle: ISessionMcpHandle,
     @ISessionInteractionService private readonly interaction: ISessionInteractionService,
     @ITelemetryService private readonly telemetry: ITelemetryService,
   ) {
@@ -144,7 +149,6 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
   }
 
   private async doCreate(agentId: string, opts: CreateAgentOptions): Promise<IAgentScopeHandle> {
-    const mcpReady = this.mcpHandle.ready;
     const agentScope = this.ctx.scope(`agents/${agentId}`);
     const agentHomedir = join(this.bootstrap.homeDir, agentScope);
     const handle = createScopedChildHandle(
@@ -152,7 +156,7 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
       LifecycleScope.Agent,
       agentId,
       {
-        extra: [
+        seeds: [
           [IAgentScopeContext, makeAgentScopeContext({ agentId, agentScope })],
           [ITelemetryService, this.telemetry.withContext({ agent_id: agentId })],
         ],
@@ -170,7 +174,6 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
         labels: opts.labels,
       });
       this.onDidCreateEmitter.fire(handle);
-      await mcpReady;
       await wire.restore();
       await this.bindBootstrap(handle, opts);
       await handle.accessor.get(IAgentToolActivationService).activate();
@@ -202,9 +205,15 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
 
   async fork(sourceAgentId: string, opts?: ForkAgentOptions): Promise<IAgentScopeHandle> {
     const source = this.handles.get(sourceAgentId);
-    if (source === undefined) throw new Error(`Source agent "${sourceAgentId}" does not exist`);
+    if (source === undefined) {
+      throw new Error2(ErrorCodes.AGENT_NOT_FOUND, `Source agent "${sourceAgentId}" does not exist`, {
+        details: { agentId: sourceAgentId },
+      });
+    }
     if (opts?.agentId !== undefined && this.handles.has(opts.agentId)) {
-      throw new Error(`Agent "${opts.agentId}" already exists`);
+      throw new Error2(ErrorCodes.AGENT_ALREADY_EXISTS, `Agent "${opts.agentId}" already exists`, {
+        details: { agentId: opts.agentId },
+      });
     }
     const child = await this.create({ agentId: opts?.agentId, forkedFrom: source.id });
 
@@ -243,6 +252,15 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
 
   broadcastPermissionMode(mode: PermissionMode): void {
     for (const handle of this.handles.values()) {
+      // Tower workers/reviewers stay pinned to auto (see the file header) —
+      // the profile name is read off the wire model, not the profile service,
+      // so the broadcast never has to materialize one.
+      if (
+        handle.accessor.get(IWireService).getModel(ProfileModel).profileName ===
+        TOWER_WORKER_PROFILE
+      ) {
+        continue;
+      }
       handle.accessor.get(IAgentPermissionModeService).setMode(mode);
     }
   }

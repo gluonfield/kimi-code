@@ -16,7 +16,10 @@
  * model, effective thinking effort, and system prompt at the turn boundary
  * so loop telemetry and every request in that turn share one configuration.
  * Forwards streamed `part` events to the caller's `onPart`
- * handler, records `usage` through `IAgentUsageService`, resolves to an
+ * handler — rewriting duplicate provider tool call ids into per-agent unique
+ * ones through `ToolCallIdNormalizer`, since self-hosted endpoints may
+ * renumber ids per response and every downstream keying assumes uniqueness —
+ * records `usage` through `IAgentUsageService`, resolves to an
  * `AgentLLMRequestFinish` on the `finish` event, logs the request lifecycle
  * (config deduplicated by content, request/response/failure lines, plus
  * per-request fields) through `log`, publishes advisory model-capability
@@ -30,14 +33,15 @@
  */
 
 import { createHash } from 'node:crypto';
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { defineState } from '#/_base/state/stateRegistry';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import {
   IAgentContextProjectorService,
   type MediaStripSnapshot,
 } from '#/agent/contextProjector/contextProjector';
-import { IAgentContextSizeService } from '#/agent/contextSize/contextSize';
+import { IAgentTokenCountingService } from '#/agent/tokenCounting/tokenCounting';
 import { IAgentProfileService, type ProfileModelContext } from '#/agent/profile/profile';
 import { IAgentStateService } from '#/agent/state/agentState';
 import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
@@ -54,7 +58,7 @@ import {
   isRecoverableRequestStructureError,
   isRetryableGenerateError,
 } from '#/kosong/contract/errors';
-import { type Message } from '#/kosong/contract/message';
+import { isToolCall, type Message, type StreamedMessagePart } from '#/kosong/contract/message';
 import { type ThinkingEffort } from '#/kosong/contract/provider';
 import { type Tool } from '#/kosong/contract/tool';
 import { emptyUsage, inputTotal, type TokenUsage } from '#/kosong/contract/usage';
@@ -90,13 +94,17 @@ import {
 } from './llmRequester';
 import type { LLMRequestTrace } from '#/kosong/contract/requestTrace';
 import {
+  ToolCallIdNormalizer,
+  type ToolCallIdResponseNormalizer,
+} from './toolCallIdNormalizer';
+import {
   LlmRequestTraceModel,
   llmRequest,
   llmToolsSnapshot,
   type LlmRequestToolSchema,
 } from './llmRequestOps';
 import { isAbortError } from '#/_base/utils/abort';
-import { unwrapErrorCause } from '#/errors';
+import { ErrorCodes, Error2, unwrapErrorCause } from '#/errors';
 import { retryErrorFields } from '#/_base/utils/retry';
 
 const EMPTY_TOOL_PARAMETERS: Record<string, unknown> = {
@@ -164,10 +172,12 @@ export const llmRequesterEmittedThinkingEffortWarningsKey = defineState<Set<stri
 export class AgentLLMRequesterService implements IAgentLLMRequesterService {
   declare readonly _serviceBrand: undefined;
 
+  private readonly toolCallIdNormalizer = new ToolCallIdNormalizer();
+
   constructor(
     @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
     @IAgentContextProjectorService private readonly projector: IAgentContextProjectorService,
-    @IAgentContextSizeService private readonly contextSize: IAgentContextSizeService,
+    @IAgentTokenCountingService private readonly tokenCounting: IAgentTokenCountingService,
     @IAgentToolRegistryService private readonly tools: IAgentToolRegistryService,
     @IAgentToolSelectService private readonly toolSelect: IAgentToolSelectService,
     @IAgentVideoResolverService private readonly videoResolver: IAgentVideoResolverService,
@@ -329,6 +339,7 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
     signal: AbortSignal | undefined,
     onRequestTrace: (traceId: string | undefined) => void,
   ): Promise<AgentLLMRequestFinish> {
+    this.toolCallIdNormalizer.seedFrom(this.context.get());
     const shaped = this.toolSelect.shapeHistory(request.messages);
     let mediaStripSnapshot = this.mediaStripSnapshotForTurn(request.source);
     const requestInput = (projection: RequestProjection) => {
@@ -382,50 +393,76 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
       this.recordRequest(logInput);
 
       let message: Message | undefined;
-      let usage = emptyUsage();
+      let usage: TokenUsage | undefined;
       let timing: ModelRequestTiming | undefined;
       let finish: Extract<ModelRequestEvent, { type: 'finish' }> | undefined;
+      const toolCallIds = this.toolCallIdNormalizer.beginResponse();
 
       const setTraceId = (traceId: string | null | undefined): void => {
         const normalized = traceId ?? undefined;
         onRequestTrace(normalized);
       };
 
-      for await (const event of request.requester.request(input, signal, {
-        ...request.params,
-        onTraceId: setTraceId,
-      })) {
-        switch (event.type) {
-          case 'part':
-            await onPart(event.part);
-            break;
-          case 'usage':
-            usage = event.usage;
-            break;
-          case 'finish':
-            finish = event;
-            message = event.message;
-            setTraceId(event.traceId);
-            break;
-          case 'timing': {
-            const { type: _type, ...streamTiming } = event;
-            timing = streamTiming;
-            break;
+      try {
+        for await (const event of request.requester.request(input, signal, {
+          ...request.params,
+          onTraceId: setTraceId,
+        })) {
+          switch (event.type) {
+            case 'part':
+              await onPart(this.normalizeStreamPart(toolCallIds, event.part));
+              break;
+            case 'usage':
+              usage = event.usage;
+              break;
+            case 'finish':
+              finish = event;
+              message = event.message;
+              setTraceId(event.traceId);
+              break;
+            case 'timing': {
+              const { type: _type, ...streamTiming } = event;
+              timing = streamTiming;
+              break;
+            }
           }
         }
+
+        if (message === undefined || finish === undefined) {
+          throw new Error2(
+            ErrorCodes.PROVIDER_API_ERROR,
+            'LLM request stream ended without a finish event.',
+          );
+        }
+
+        const finalizedCalls = toolCallIds.remapFinalizedCalls(message.toolCalls);
+        if (finalizedCalls !== message.toolCalls) {
+          message = { ...message, toolCalls: finalizedCalls };
+        }
+        for (const { raw, assigned } of toolCallIds.remapped) {
+          this.log.warn('Rewrote a duplicate provider tool call id into an agent-unique one.', {
+            raw,
+            assigned,
+            model: request.modelAlias,
+          });
+        }
+      } catch (error) {
+        toolCallIds.rollback();
+        throw error;
       }
 
-      if (message === undefined || finish === undefined) {
-        throw new Error('LLM request stream ended without a finish event.');
+      this.usage.record(request.modelAlias, usage ?? emptyUsage(), request.source);
+      // Only a stream that actually reported usage may write a measured
+      // anchor — recording emptyUsage() zeros would zero the context size and
+      // silence compaction for providers without usage reporting.
+      if (usage !== undefined) {
+        this.tokenCounting.measured(request.messages, [message], usage);
       }
-
-      this.usage.record(request.modelAlias, usage, request.source);
-      this.contextSize.measured(request.messages, [message], usage);
-      this.logResponse(request.logFields, usage, timing);
+      this.logResponse(request.logFields, usage ?? emptyUsage(), timing);
 
       return {
         message,
-        usage,
+        usage: usage ?? emptyUsage(),
         model: request.modelAlias,
         providerFinishReason: finish.providerFinishReason,
         rawFinishReason: finish.rawFinishReason,
@@ -502,6 +539,15 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
         throw error;
       }
     }
+  }
+
+  private normalizeStreamPart(
+    toolCallIds: ToolCallIdResponseNormalizer,
+    part: StreamedMessagePart,
+  ): StreamedMessagePart {
+    if (!isToolCall(part)) return part;
+    const assigned = toolCallIds.remapStreamedId(part.id, part._streamIndex);
+    return assigned === part.id ? part : { ...part, id: assigned };
   }
 
   private warnAboutAnthropicThinkingEffort(request: ResolvedLLMRequest): void {
@@ -582,7 +628,7 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
       capability: resolved.modelCapabilities,
       usedContextTokens:
         overrides.messages === undefined
-          ? this.contextSize.get().measured
+          ? this.tokenCounting.get().measured
           : undefined,
     });
     const requester = this.modelCatalog.getRequester(resolved.modelAlias);

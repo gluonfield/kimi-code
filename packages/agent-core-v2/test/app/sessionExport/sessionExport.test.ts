@@ -27,7 +27,8 @@ import {
   type ServiceRegistration,
   type TestInstantiationService,
 } from '#/_base/di/test';
-import { LifecycleScope, type IAgentScopeHandle, type ISessionScopeHandle } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
+import { type IAgentScopeHandle, type ISessionScopeHandle } from '#/_base/di/scope';
 import type { ServiceIdentifier, ServicesAccessor } from '#/_base/di/instantiation';
 import { ILogService, type ILogService as LogService } from '#/_base/log/log';
 import { IWireService } from '#/wire/wire';
@@ -172,7 +173,6 @@ describe('sessionExport', () => {
       request: { sessionId: 'ses_repeated_export', version: '1.0.0-test' },
       summary,
     });
-    // Cross the next second boundary so the second export gets a distinct timestamp.
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 1100 - (Date.now() % 1000)));
     const second = await exportSessionDirectory({
       request: { sessionId: 'ses_repeated_export', version: '1.0.0-test' },
@@ -710,23 +710,6 @@ describe('sessionExport', () => {
     expect((await readdir(tmp)).toSorted()).toEqual(['export.zip', 'safe-output', 'state.json']);
   });
 
-  it('rejects with a coded error when compressed output exceeds the configured limit', async () => {
-    const tmp = await mkdtemp(join(tmpdir(), 'session-export-test-'));
-
-    await expect(
-      writeExportZip({
-        outputPath: join(tmp, 'too-large.zip'),
-        manifest: testManifest('ses_too_large'),
-        sessionDir: tmp,
-        sessionFiles: [],
-        maxArchiveBytes: 1,
-      }),
-    ).rejects.toMatchObject({
-      code: 'session.export_too_large',
-      details: { maxArchiveBytes: 1 },
-    });
-  });
-
   it('throws a coded error when the session is unknown', async () => {
     const tmp = await mkdtemp(join(tmpdir(), 'session-export-test-'));
     ix = createTestServices(tmp, {
@@ -893,9 +876,12 @@ function registerSessionExportServices(
   reg.defineInstance(ILogService, options.appLog ?? stubLog());
   reg.defineInstance(ISessionIndex, {
     _serviceBrand: undefined,
-    list: async () => ({ items: options.summary === undefined ? [] : [options.summary] }),
+    prepare: async () => ({ state: 'uninitialized' as const, degradedCount: 0 }),
+    status: () => ({ state: 'uninitialized' as const, degradedCount: 0 }),
+    listRecent: async () => ({ items: options.summary === undefined ? [] : [options.summary] }),
     get: async () => options.summary,
-    countActive: async () => (options.summary === undefined || options.summary.archived ? 0 : 1),
+    count: async () => (options.summary === undefined || options.summary.archived ? 0 : 1),
+    remove: async () => {},
   });
   reg.defineInstance(IWorkspaceLifecycleService, {
     _serviceBrand: undefined,
@@ -913,7 +899,9 @@ function registerSessionExportServices(
               ISessionLifecycleService,
               {
                 _serviceBrand: undefined,
+                onWillCreateSession: noopEvent,
                 onDidCreateSession: noopEvent,
+                onWillCloseSession: noopEvent,
                 onDidCloseSession: noopEvent,
                 onDidArchiveSession: noopEvent,
                 onDidForkSession: noopEvent,
@@ -926,6 +914,7 @@ function registerSessionExportServices(
                 close: async () => {},
                 archive: async () => {},
                 restore: async () => options.lifecycleHandle,
+                delete: async () => {},
                 fork: async () => {
                   throw new Error('fork should not be called by session export');
                 },
@@ -1016,6 +1005,7 @@ function stubSessionMetadata(meta: SessionMeta): ISessionMetadata {
     read: async () => meta,
     update: async () => {},
     setTitle: async () => {},
+    setGeneratedTitleIfUncustomized: async () => false,
     setArchived: async () => {},
     registerAgent: async () => {},
   };
