@@ -28,6 +28,7 @@ import { IConfigService } from '#/app/config/config';
 import type { LoopControl } from '#/agent/loop/configSection';
 import { IAgentRuntimeService } from '#/agent/runtimeBinding/agentRuntime';
 import { RuntimeWorkspaceView } from '#/runtime/runtimeWorkspaceView';
+import { MAIN_AGENT_ID } from '#/session/agentLifecycle/agentLifecycle';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import type { ToolSource } from '#/tool/toolContract';
 import { ISessionWorkspaceContext } from '#/session/workspaceContext/workspaceContext';
@@ -506,7 +507,11 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
   }
 
   getSystemPrompt(): string {
-    return this.systemPrompt;
+    const append =
+      this.scopeContext.agentId === MAIN_AGENT_ID
+        ? this.sessionContext.systemPromptAppend
+        : undefined;
+    return append ? `${this.systemPrompt}\n\n${append}` : this.systemPrompt;
   }
 
   getActiveToolNames(): readonly string[] | undefined {

@@ -804,7 +804,7 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
       toolSelect: this.toolSelect.enabled(),
       systemPromptHash,
       systemPrompt:
-        input.systemPrompt === this.profile.data().systemPrompt
+        input.systemPrompt === this.profile.getSystemPrompt()
           ? undefined
           : input.systemPrompt,
       toolsHash,

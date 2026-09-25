@@ -22,6 +22,7 @@ export const createSessionOptionsSchema = z.object({
    * connected only for the created session, never persisted.
    */
   mcpServers: z.record(z.string(), mcpServerConfigSchema).optional(),
+  systemPromptAppend: z.string().optional(),
 });
 
 /** Same fields as `ResumeSessionOptions` in the engine — keep in sync. */
@@ -32,6 +33,7 @@ export const resumeSessionOptionsSchema = z.object({
    * cold session (ignored when the session is already live).
    */
   mcpServers: z.record(z.string(), mcpServerConfigSchema).optional(),
+  systemPromptAppend: z.string().optional(),
 });
 
 /** Same fields as `ForkSessionOptions` in the engine — keep in sync. */

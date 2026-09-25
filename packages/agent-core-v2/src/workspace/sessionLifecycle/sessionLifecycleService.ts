@@ -254,6 +254,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       sessionDir,
       metaScope,
       cwd: opts.workDir,
+      systemPromptAppend: opts.systemPromptAppend,
       scope: (subKey?: string): string =>
         subKey === undefined || subKey === '' ? sessionScope : `${sessionScope}/${subKey}`,
     };
@@ -388,6 +389,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       workDir,
       additionalDirs: opts?.additionalDirs,
       mcpServers: opts?.mcpServers,
+      systemPromptAppend: opts?.systemPromptAppend,
     });
     try {
       const agents = handle.accessor.get(IAgentLifecycleService);

@@ -15,6 +15,7 @@ export interface CreateSessionOptions {
   readonly additionalDirs?: readonly string[];
   readonly mainAgentBinding?: BindAgentInput;
   readonly mcpServers?: Readonly<Record<string, McpServerConfig>>;
+  readonly systemPromptAppend?: string;
 }
 
 export interface ForkSessionOptions {
@@ -28,6 +29,7 @@ export interface ForkSessionOptions {
 export interface ResumeSessionOptions {
   readonly additionalDirs?: readonly string[];
   readonly mcpServers?: Readonly<Record<string, McpServerConfig>>;
+  readonly systemPromptAppend?: string;
 }
 
 export interface CreateChildSessionOptions {
