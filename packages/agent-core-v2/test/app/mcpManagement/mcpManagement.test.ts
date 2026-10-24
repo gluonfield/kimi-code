@@ -110,7 +110,10 @@ describe('McpManagementService', () => {
     const ix = createServices(disposables, {
       additionalServices: (reg) => {
         reg.defineInstance(IFileSystemStorageService, storage);
-        reg.definePartialInstance(IBootstrapService, { homeDir: home });
+        reg.definePartialInstance(IBootstrapService, {
+          homeDir: home,
+          getEnv: () => undefined,
+        });
         reg.define(IMcpConfigStore, McpConfigStore);
         reg.definePartialInstance(IPluginService, {
           mcpServerEntries: async () => {
@@ -133,6 +136,7 @@ describe('McpManagementService', () => {
         reg.defineInstance(IHostProcessService, hostProcess);
         reg.definePartialInstance(IAtomicDocumentStore, {
           get: async <T>() => (trusted ? ({} as T) : undefined),
+          list: async () => [],
         });
         reg.define(IMcpRegistryService, McpRegistryService);
         reg.defineInstance(IMcpOAuthService, oauth);

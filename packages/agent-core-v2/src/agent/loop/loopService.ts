@@ -43,6 +43,7 @@ import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import { IAgentStateService } from '#/agent/state/agentState';
 import { IFileService } from '#/app/file/fileService';
 import { IPluginService } from '#/app/plugin/plugin';
+import { ISessionRunGate } from '#/session/sessionActivity/sessionRunGate';
 import type {
   TurnEndedEvent as TurnEndedTelemetryEvent,
   TurnInterruptedEvent,
@@ -84,6 +85,7 @@ import {
   type TurnResult,
 } from './loop';
 import { mergeSteerMessages, stripBundledSkillBlocks } from '#human/agent/origin';
+import { isUserPromptSubmitHookPart } from '#/agent/contextMemory/hookParts';
 import { createUserEntry, type UserEntry } from '#human/agent/turn';
 import {
   AssistantDelta,
@@ -168,6 +170,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     @IInstantiationService private readonly instantiation: IInstantiationService,
     @IAgentProfileService private readonly profile: IAgentProfileService,
     @IPluginService private readonly plugins: IPluginService,
+    @ISessionRunGate private readonly runGate: ISessionRunGate,
   ) {
     super();
     this.states.contributeState(turnKey);
@@ -300,6 +303,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
 
   submit(input: UserEntry, options?: LoopSubmitOptions): LoopSubmitResult {
     if (this.disposing) throw abortError('Agent loop disposed');
+    this.runGate.begin();
     const meta = input.meta;
     const id = meta?.promptId ?? newMessageId();
     const origin = (meta?.origin as PromptOrigin | undefined) ?? { kind: 'user' };
@@ -590,6 +594,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     const ctx: PromptSubmitContext = {
       promptMessage,
       isSteer: false,
+      hookParts: [],
       block: false,
     };
     await this.hooks.onBeforeSubmitPrompt.run(ctx);
@@ -599,7 +604,10 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
       block: false,
       message: {
         role: 'user',
-        content: gateImageFormatParts(promptMessage.content, this.profile.getModelProviderType()),
+        content: [
+          ...ctx.hookParts,
+          ...gateImageFormatParts(promptMessage.content, this.profile.getModelProviderType()),
+        ],
       },
     };
   }
@@ -1093,7 +1101,8 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
       message: { role: 'user', content: [...seededMessage.content] },
       meta: { promptId: waiter.id, origin: seededMessage.origin, tracked: false },
     };
-    this.beginActiveTurn(waiter, entry, pending.id);
+    const seededTurn = this.beginActiveTurn(waiter, entry, pending.id);
+    this.settlePromptLaunched(waiter, seededTurn);
     return true;
   }
 
@@ -1206,7 +1215,10 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
         promptId: prompt.promptId,
         origin: prompt.origin,
         prompt: isDisplayablePromptOrigin(prompt.origin)
-          ? turnPromptText(prompt.message.content, prompt.origin)
+          ? turnPromptText(
+              prompt.message.content.filter((part) => !isUserPromptSubmitHookPart(part)),
+              prompt.origin,
+            )
           : undefined,
         promptAttachments: turnPromptAttachments(prompt.message.content, prompt.origin),
       }),

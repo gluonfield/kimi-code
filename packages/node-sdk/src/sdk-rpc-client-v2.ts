@@ -119,11 +119,9 @@
  *   `ISessionBtwService`; `setSwarmMode` / `swarm` → the agent scope's
  *   `IAgentSwarmService` (the v2 port of v1's `SwarmMode`), with `swarm()`
  *   recomposed over the `setSwarmMode` + `prompt` overrides; `setTowerMode` →
- *   the agent scope's `IAgentTowerService` (v2-only — the base class throws
+ *   the agent scope's `IAgentTowerService`; `getTowerStatus` → the shared
+ *   tower status summary reader (v2-only — the base class throws
  *   `not_implemented`).
- *   `createSessionWithKaos` / `resumeSessionWithKaos` deliberately keep the
- *   base class's kaos-ignoring degradation (the v2 engine has no kaos
- *   injection point — see the session-lifecycle section header), and
  *   `toolCall` keeps the base class's "not supported" answer, which the
  *   interaction bridge already relies on.
  */
@@ -132,14 +130,12 @@ import { join } from 'node:path';
 
 import { encodeWorkDirKey } from '@moonshot-ai/agent-core-v2/_base/utils/workdir-slug';
 import { McpConnectionManager } from '@moonshot-ai/agent-core-v2/mcpCore/connection-manager';
-import {
-  loadMcpServers,
-  loadMcpServersDetailed,
-  resolveMcpJsonPaths,
-} from '@moonshot-ai/agent-core-v2/app/mcpConfig/configLoader';
+import { ITowerRateLimitService } from '@moonshot-ai/agent-core-v2/features/tower/towerRateLimit';
+import { readTowerStatusSummary } from '@moonshot-ai/agent-core-v2/features/tower/tools/status/statusReader';
+import { loadMcpServers } from '@moonshot-ai/agent-core-v2/app/mcpConfig/configLoader';
 import { fsSuggestRequestSchema } from '@moonshot-ai/agent-core-v2/workspace/workspaceFs/fs';
 import { IAppendLogStore } from '@moonshot-ai/agent-core-v2/persistence/interface/appendLogStore';
-import type { McpServerConfig as WorkspaceMcpServerConfig } from '@moonshot-ai/agent-core-v2/mcpCore/config-schema';
+import { ISessionLockService } from '@moonshot-ai/agent-core-v2/persistence/interface/sessionLock';
 import {
   bootstrap,
   DEFAULT_AGENT_PROFILE_NAME,
@@ -148,7 +144,10 @@ import {
   drainSessionIndexMirror,
   ensureKimiHome,
   ensureMainAgent,
+  getOrRestoreAgent,
+  reloadOnStale,
   agentContextOf,
+  IAgentChangeNotifierService,
   IAgentContextMemoryService,
   IAgentConversationUndoService,
   IAgentCronService,
@@ -189,6 +188,7 @@ import {
   ISessionManager,
   ISessionMcpHandle,
   ISessionMetadata,
+  ISessionAgentProfileCatalog,
   ISessionSkillCatalog,
   IAgentTodoService,
   ISessionWorkspaceContext,
@@ -215,6 +215,7 @@ import {
   ErrorCodes as V2ErrorCodes,
   resolveAgentTaskConfig,
   resolveConfigPath,
+  resolveSubagentModelPool,
   resolveKimiHome,
   resolveLoggingConfig,
   resolvePrintBackgroundMode,
@@ -227,6 +228,7 @@ import {
   type Scope,
   type ServicesAccessor,
   type SessionSummary as V2SessionSummary,
+  type SubagentModelPoolSnapshot,
 } from '@moonshot-ai/agent-core-v2';
 import {
   RPCError,
@@ -234,6 +236,8 @@ import {
   type Klient,
   type ImportCustomRegistryOptions,
   type ImportCustomRegistryResult,
+  type RefreshProviderModelsOptions,
+  type RefreshProviderModelsResponse,
 } from '@moonshot-ai/klient';
 import { RegistryImportError } from '#/catalog';
 import { createKlient } from '@moonshot-ai/klient/memory';
@@ -251,6 +255,7 @@ import {
   SDKRpcClientBase,
   type ActivatePluginCommandRpcInput,
   type ActivateSkillRpcInput,
+  type ConfigSectionChange,
   type ImportContextRpcInput,
   type ReconnectMcpServerRpcInput,
   type ReloadSessionRpcInput,
@@ -321,8 +326,10 @@ import type {
   SuggestFilesInput,
   SuggestFilesResult,
   TelemetryClient,
+  Unsubscribe,
   UploadFileOptions,
   WorkspaceTrustInfo,
+  WorkspaceTrustInstructionSources,
 } from '#/types';
 import {
   diagnosticsToConfigDiagnostics,
@@ -686,39 +693,33 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
   /**
    * klient has no workspace-trust facade; composed directly from the engine
    * via {@link engineAccessor} — the same `handlerFor({ root })` path
-   * `createSession` takes (materializing the workspace handler is a no-op
-   * cost here: session creation does it anyway). The gated-server list is
-   * the final merged config entries whose origins are project files (the
-   * workspaceTrust gate inside the engine's `workspaceMcpConfig`),
-   * computed best-effort: an unreadable/invalid project file degrades to an
-   * empty list rather than failing the caller.
+   * `createSession` takes. The disclosure of what trusting would activate is
+   * computed inside the engine by `WorkspaceTrustDisclosureService`.
    */
   override async getWorkspaceTrustInfo(workDir: string): Promise<WorkspaceTrustInfo> {
     const handler = await this.engineAccessor
       .get(IWorkspaceInstanceManager)
       .getOrCreate({ root: workDir });
     const trusted = await handler.program.trust.get();
-    if (trusted) return { trusted: true, gatedMcpServers: [] };
-    try {
-      const fs = this.engineAccessor.get(IHostFileSystem);
-      const [paths, loaded] = await Promise.all([
-        resolveMcpJsonPaths({ fs, cwd: workDir, homeDir: this.homeDir }),
-        loadMcpServersDetailed({
-          fs,
-          cwd: workDir,
-          homeDir: this.homeDir,
-          includeProject: true,
-        }),
-      ]);
-      const projectPaths = new Set([paths.projectRoot, paths.project]);
-      const gatedMcpServers = Object.entries(loaded.servers)
-        .filter(([name]) => projectPaths.has(loaded.origins[name] ?? ''))
-        .map(([name, config]) => describeWorkspaceMcpServer(name, config))
-        .toSorted((a, b) => a.name.localeCompare(b.name));
-      return { trusted: false, gatedMcpServers };
-    } catch {
-      return { trusted: false, gatedMcpServers: [] };
+    if (trusted) {
+      return {
+        trusted: true,
+        gatedMcpServers: [],
+        gatedAdditionalDirs: [],
+        additionalDirSources: [],
+        warnings: [],
+        instructionSources: EMPTY_INSTRUCTION_SOURCES,
+      };
     }
+    const activation = await handler.program.trustDisclosure.describeGatedActivation();
+    return {
+      trusted: false,
+      gatedMcpServers: activation.mcpServers,
+      gatedAdditionalDirs: activation.additionalDirs,
+      additionalDirSources: activation.additionalDirSources,
+      warnings: activation.warnings,
+      instructionSources: activation.instructionSources,
+    };
   }
 
   /**
@@ -752,6 +753,15 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
   override async getConfigDiagnostics(): Promise<ConfigDiagnostics> {
     await this.configReady;
     return diagnosticsToConfigDiagnostics(await this.klient.global.config.diagnostics());
+  }
+
+  override onConfigSectionChanged(
+    listener: (change: ConfigSectionChange) => void,
+  ): Unsubscribe {
+    const subscription = this.klient.events.on('config.sectionChanged', listener);
+    return () => {
+      subscription.dispose();
+    };
   }
 
   /**
@@ -812,10 +822,6 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
     return this.getConfig();
   }
 
-  override supportsAtomicSectionReplace(): boolean {
-    return true;
-  }
-
   override async importCustomRegistry(
     options: ImportCustomRegistryOptions,
   ): Promise<ImportCustomRegistryResult> {
@@ -834,9 +840,11 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
     }
   }
 
-  override async replaceConfigSections(sections: Record<string, unknown>): Promise<void> {
+  override async refreshProviderModels(
+    options?: RefreshProviderModelsOptions,
+  ): Promise<RefreshProviderModelsResponse> {
     await this.configReady;
-    await this.klient.global.config.replaceSections({ sections });
+    return this.klient.global.kosong.refreshProviders(options);
   }
 
   override async listPlugins(): Promise<readonly PluginSummary[]> {
@@ -937,15 +945,6 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
   // metadata mutations of a LIVE session; everything that needs an explicit
   // session id, a resume, or a workspace command goes through the
   // `engineAccessor` escape hatch (named per method below).
-  //
-  // `createSessionWithKaos` / `resumeSessionWithKaos` are deliberately NOT
-  // overridden: agent-core-v2 has no kaos injection point (its fs/process
-  // abstraction is the engine-internal hostFs domain, resolved at bootstrap),
-  // so the base class's degradation — ignore the kaos arguments and run a
-  // plain local create/resume — is the honest behavior, the same one every
-  // daemon-transport client settles for. Failing loudly instead would break
-  // hosts that pass kaos opportunistically (the harness forwards it whenever
-  // the host supplies one).
   // -----------------------------------------------------------------------
 
   private liveSession(sessionId: string): ISessionScopeHandle | undefined {
@@ -1007,6 +1006,30 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
       return await action();
     } finally {
       await closeSessionById(this.engineAccessor, sessionId);
+    }
+  }
+
+  /**
+   * Runs a call that may start a session run. When another client updated the
+   * session (`session.stale`), the engine reloads it from disk, this client
+   * re-wires it and lets the host refresh through the stale-reload handler,
+   * then the call is retried once (or rejected again when `retry` is false).
+   */
+  private async withStaleReload<T>(
+    sessionId: string,
+    run: () => Promise<T>,
+    retry = true,
+  ): Promise<T> {
+    try {
+      return await reloadOnStale(this.engineAccessor, sessionId, run, {
+        retry,
+        onReloaded: async (handle) => {
+          this.wireSession(handle);
+          await this.notifyStaleReload(sessionId, await this.resumedSessionSummary(handle));
+        },
+      });
+    } catch (error) {
+      throw restateEngineError(error);
     }
   }
 
@@ -1216,6 +1239,7 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
       },
       context: context as AgentContextData,
       replay: folded.replay,
+      userTurnCount: type === 'main' ? folded.userTurnCount : undefined,
       permission: {
         mode: agent.accessor.get(IAgentPermissionModeService).mode,
         rules: [...agent.accessor.get(IAgentPermissionRulesService).rules],
@@ -1597,6 +1621,8 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
     const sessionId = input.sessionId;
     return this.runSessionAccess(sessionId, async () => {
       const live = this.liveSession(sessionId);
+      const indexEntry =
+        live === undefined ? await this.engineAccessor.get(ISessionIndex).get(sessionId) : undefined;
       if (live !== undefined) {
         const agentLifecycle = live.accessor.get(IAgentLifecycleService);
         for (const agent of agentLifecycle.list()) {
@@ -1609,14 +1635,55 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
               { details: { sessionId } },
             );
           }
+          if (agentHandle.accessor.get(IAgentFullCompactionService).compacting !== null) {
+            throw new KimiError(
+              ErrorCodes.TURN_AGENT_BUSY,
+              `Session "${sessionId}" cannot be reloaded while compaction is running`,
+              { details: { sessionId } },
+            );
+          }
         }
-      } else if ((await this.engineAccessor.get(ISessionIndex).get(sessionId)) === undefined) {
+      } else if (indexEntry === undefined) {
         throw SDKRpcClientV2.sessionNotFound(sessionId);
       }
+      const workspaceId =
+        live?.accessor.get(ISessionContext).workspaceId ?? indexEntry?.workspaceId;
+      let previousSubagentNames: readonly string[] | undefined;
+      let previousModelPool: SubagentModelPoolSnapshot | null | undefined;
+      let staleNotifier: IAgentChangeNotifierService | undefined;
+      if (live !== undefined) {
+        const main = live.accessor.get(IAgentLifecycleService).handleOf(MAIN_AGENT_ID);
+        if (main !== undefined) {
+          previousSubagentNames = main.accessor
+            .get(ISessionAgentProfileCatalog)
+            .list()
+            .map((profile) => profile.name);
+          const pool = resolveSubagentModelPool(main.accessor.get(IConfigService));
+          previousModelPool =
+            pool === undefined
+              ? null
+              : { defaultModel: pool.defaultModel, models: { ...pool.models } };
+          staleNotifier = main.accessor.get(IAgentChangeNotifierService);
+          staleNotifier.mute();
+        }
+      }
       await this.configReady;
-      await this.klient.global.config.reload();
-      await this.klient.global.plugins.reload();
-      await this.refreshPluginSessionStarts(sessionId);
+      try {
+        await this.klient.global.config.reload();
+        await this.klient.global.plugins.reload();
+        await this.reloadWorkspaceCatalogs(workspaceId);
+        await this.refreshPluginSessionStarts(sessionId);
+      } catch (error) {
+        if (staleNotifier !== undefined) {
+          staleNotifier.unmute();
+          await Promise.all([
+            staleNotifier.notifyAgentsMdChanges(),
+            staleNotifier.notifySkillChanges(),
+            staleNotifier.notifySubagentChanges({}),
+          ]).catch(() => undefined);
+        }
+        throw error;
+      }
       if (live !== undefined) {
         await closeSessionById(this.engineAccessor, sessionId);
       }
@@ -1624,16 +1691,31 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
       if (handle === undefined) throw SDKRpcClientV2.sessionNotFound(sessionId);
       const main = handle.accessor.get(IAgentLifecycleService).handleOf(MAIN_AGENT_ID);
       await main?.accessor.get(IAgentPluginService).refreshSessionStart();
+      if (main !== undefined) {
+        const notifier = main.accessor.get(IAgentChangeNotifierService);
+        await notifier.notifyAgentsMdChanges();
+        await notifier.notifySkillChanges();
+        await notifier.notifySubagentChanges({ previousSubagentNames, previousModelPool });
+      }
       this.wireSession(handle);
       return this.resumedSessionSummary(handle);
     });
+  }
+
+  private async reloadWorkspaceCatalogs(workspaceId: string | undefined): Promise<void> {
+    if (workspaceId === undefined) return;
+    const target = this.engineAccessor.get(IWorkspaceInstanceManager).get(workspaceId);
+    if (target === undefined) return;
+    await target.program.instructions.reload();
+    await target.program.skills.reload();
+    await target.program.agentProfiles.reload().catch(() => undefined);
+    await target.program.userAgentProfiles.reload().catch(() => undefined);
   }
 
   private async refreshPluginSessionStarts(excludedSessionId?: string): Promise<void> {
     const workspaces = this.engineAccessor.get(IWorkspaceInstanceManager);
     await Promise.all(
       workspaces.list().map(async (handler) => {
-        await handler.program.skills.reload();
         const sessions = this.engineAccessor
           .get(ISessionManager)
           .list()
@@ -1737,8 +1819,10 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
   // reached through the live session handle. Every override requires a live
   // session (v1's `requireSession`) and resolves the target agent from
   // `interactiveAgentId`: the main agent materializes on first use with the
-  // default profile bound (v1's eager equivalent); any other agent must
-  // already exist (v1's `AGENT_NOT_FOUND`).
+  // default profile bound (v1's eager equivalent); any other agent is lazily
+  // rebuilt from its persisted session metadata when the live scope is gone
+  // (session reload), falling back to v1's `AGENT_NOT_FOUND` only when the
+  // agent was never registered.
   // -----------------------------------------------------------------------
 
   /**
@@ -1787,7 +1871,7 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
     const session = this.requireLiveSession(sessionId);
     const agentId = this.interactiveAgentId;
     if (agentId === MAIN_AGENT_ID) return this.materializeMainAgent(session);
-    const agent = session.accessor.get(IAgentLifecycleService).handleOf(agentId);
+    const agent = await getOrRestoreAgent(session, agentId);
     if (agent === undefined) {
       throw new KimiError(ErrorCodes.AGENT_NOT_FOUND, `Agent "${agentId}" was not found`);
     }
@@ -1952,10 +2036,12 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
    * `compaction.unable` on an empty history or an active turn.
    */
   override async compact(input: SessionIdRpcInput & CompactOptions): Promise<void> {
-    const agent = await this.agentScope(input.sessionId);
-    agent.accessor.get(IAgentFullCompactionService).begin({
-      source: 'manual',
-      instruction: input.instruction,
+    await this.withStaleReload(input.sessionId, async () => {
+      const agent = await this.agentScope(input.sessionId);
+      agent.accessor.get(IAgentFullCompactionService).begin({
+        source: 'manual',
+        instruction: input.instruction,
+      });
     });
   }
 
@@ -1987,8 +2073,18 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
   }
 
   override async undoHistory(input: SessionIdRpcInput & { count: number }): Promise<void> {
-    const agent = await this.agentScope(input.sessionId);
-    await agent.accessor.get(IAgentConversationUndoService).undo(input.count);
+    await this.withStaleReload(
+      input.sessionId,
+      async () => {
+        const agent = await this.agentScope(input.sessionId);
+        await agent.accessor.get(IAgentConversationUndoService).undo(input.count);
+      },
+      false,
+    );
+  }
+
+  override async takeOverSessionLock(input: SessionIdRpcInput): Promise<void> {
+    this.engineAccessor.get(ISessionLockService).takeover(input.sessionId);
   }
 
   /**
@@ -2048,10 +2144,12 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
    * where v2 queues it FIFO.
    */
   override async prompt(input: SessionPromptRpcInput): Promise<void> {
-    const agent = await this.agentFacade(input.sessionId);
-    await agent.prompt({
-      input: input.input,
-      promptId: input.promptId,
+    await this.withStaleReload(input.sessionId, async () => {
+      const agent = await this.agentFacade(input.sessionId);
+      await agent.prompt({
+        input: input.input,
+        promptId: input.promptId,
+      });
     });
   }
 
@@ -2060,13 +2158,15 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
    * the engine renders every skill activation into the prompt's own user
    * message, so the bundle launches as one turn and undoes as a single
    * anchor. v2-only: the base class rejects this method on the v1 engine.
-   * The launch result is dropped like `prompt` (v1's RPC shape returns void).
    */
   override async promptWithSkills(input: SessionPromptWithSkillsRpcInput): Promise<void> {
-    const agent = await this.agentFacade(input.sessionId);
-    await agent.promptWithSkills({
-      input: input.input,
-      skills: input.skills,
+    await this.withStaleReload(input.sessionId, async () => {
+      const agent = await this.agentFacade(input.sessionId);
+      await agent.promptWithSkills({
+        input: input.input,
+        skills: input.skills,
+        steerIfActive: input.steerIfActive,
+      });
     });
   }
 
@@ -2077,8 +2177,10 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
    * title/lastPrompt are updated like a prompt's.
    */
   override async steer(input: SessionPromptRpcInput): Promise<void> {
-    const agent = await this.agentFacade(input.sessionId);
-    await agent.steer({ input: input.input });
+    await this.withStaleReload(input.sessionId, async () => {
+      const agent = await this.agentFacade(input.sessionId);
+      await agent.steer({ input: input.input });
+    });
   }
 
   /**
@@ -2136,11 +2238,13 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
    * v1 drops the activation while a turn runs where v2 queues it.
    */
   override async activatePluginCommand(input: ActivatePluginCommandRpcInput): Promise<void> {
-    const agent = await this.agentScope(input.sessionId);
-    await agent.accessor.get(IAgentPluginCommandService).activate({
-      pluginId: input.pluginId,
-      commandName: input.commandName,
-      args: input.args,
+    await this.withStaleReload(input.sessionId, async () => {
+      const agent = await this.agentScope(input.sessionId);
+      await agent.accessor.get(IAgentPluginCommandService).activate({
+        pluginId: input.pluginId,
+        commandName: input.commandName,
+        args: input.args,
+      });
     });
   }
 
@@ -2252,6 +2356,18 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
       await tower.exit();
     }
     await agent.accessor.get(IAgentReminderService).reconcileWhenIdle('tower_mode');
+  }
+
+  /** Reads the shared tower status summary; the main agent's tower service is authoritative. */
+  override async getTowerStatus(input: SessionIdRpcInput): Promise<string> {
+    const agent = await this.materializeMainAgent(this.requireLiveSession(input.sessionId));
+    return readTowerStatusSummary({
+      active: agent.accessor.get(IAgentTowerService).isActive,
+      cwd: agent.accessor.get(ISessionContext).cwd,
+      agentId: MAIN_AGENT_ID,
+      tasks: agent.accessor.get(IAgentTaskService),
+      concurrency: () => agent.accessor.get(ITowerRateLimitService).snapshot(),
+    });
   }
 
   // -----------------------------------------------------------------------
@@ -2837,7 +2953,7 @@ function normalizeRequiredWorkDir(operation: string, workDir: string): string {
 
 /**
  * Restate an engine `Error2` in the SDK's public error shape (`KimiError`,
- * what `isKimiError` branches on) so the delegated management plane throws
+ * what `isKimiError` branches on) so the engine-backed entry points throw
  * the same class the v1 client throws for the same failure. Non-Error2
  * failures (DI resolution bugs, aborts) pass through untouched.
  *
@@ -2872,18 +2988,10 @@ function toManagedServerInfo(server: McpManagedServer): McpManagedServerInfo {
   } as McpManagedServerInfo;
 }
 
-function describeWorkspaceMcpServer(
-  name: string,
-  config: WorkspaceMcpServerConfig,
-): WorkspaceTrustInfo['gatedMcpServers'][number] {
-  if (config.transport === 'stdio') {
-    return {
-      name,
-      transport: config.transport,
-      command: config.command,
-      args: config.args,
-      cwd: config.cwd,
-    };
-  }
-  return { name, transport: config.transport, url: config.url };
-}
+const EMPTY_INSTRUCTION_SOURCES: WorkspaceTrustInstructionSources = {
+  agentsMdPaths: [],
+  skills: [],
+  agentProfiles: [],
+  paths: [],
+};
+
