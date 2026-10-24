@@ -30,7 +30,6 @@ import { IConfigService } from '#/app/config/config';
 import type { LoopControl } from '#/agent/loop/configSection';
 import { IAgentRuntimeService } from '#/agent/runtimeBinding/agentRuntime';
 import { RuntimeWorkspaceView } from '#/runtime/runtimeWorkspaceView';
-import { MAIN_AGENT_ID } from '#/session/agentLifecycle/agentLifecycle';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import type { ToolSource } from '#/tool/toolContract';
 import { ISessionWorkspaceContext } from '#/session/workspaceContext/workspaceContext';
@@ -77,6 +76,7 @@ import {
   subagentAllowlistFor,
   withoutDelegatingTargets,
 } from '#/app/agentProfileCatalog/profile-shared';
+import { MAIN_AGENT_ID } from '#/session/agentLifecycle/agentLifecycle';
 import { getAgentToolContributions } from '#/agent/toolRegistry/toolContribution';
 import {
   profileActiveToolsKey,
