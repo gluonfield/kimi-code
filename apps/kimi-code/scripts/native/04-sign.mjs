@@ -10,7 +10,7 @@ const ENTITLEMENTS_PATH = resolve(import.meta.dirname, 'entitlements.plist');
 
 export function buildCodesignArgs({ identity, executable, entitlementsPath, keychainPath }) {
   if (identity === '-') {
-    return ['--sign', '-', executable];
+    return ['--force', '--sign', '-', executable];
   }
   const args = [
     '--sign',

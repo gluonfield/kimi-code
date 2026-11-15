@@ -533,7 +533,9 @@ export class AgentProfileService extends Disposable implements IAgentProfileServ
   }
 
   getSystemPrompt(snapshot: ProfileBindingSnapshot = this.profileState): string {
-    return snapshot.systemPrompt;
+    const append =
+      this.scopeContext.agentId === MAIN_AGENT_ID ? this.sessionContext.systemPromptAppend : undefined;
+    return append ? `${snapshot.systemPrompt}\n\n${append}` : snapshot.systemPrompt;
   }
 
   getActiveToolNames(snapshot: ProfileBindingSnapshot = this.profileState): readonly string[] | undefined {

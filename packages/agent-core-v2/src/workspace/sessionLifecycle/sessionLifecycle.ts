@@ -19,6 +19,7 @@ export interface CreateSessionOptions {
   readonly environmentCwd?: string;
   readonly mcpServers?: Readonly<Record<string, McpServerConfig>>;
   readonly prepare?: (session: ISessionScopeHandle) => Promise<void>;
+  readonly systemPromptAppend?: string;
 }
 
 export interface ForkSessionOptions {
@@ -32,6 +33,7 @@ export interface ForkSessionOptions {
 export interface ResumeSessionOptions {
   readonly additionalDirs?: readonly string[];
   readonly mcpServers?: Readonly<Record<string, McpServerConfig>>;
+  readonly systemPromptAppend?: string;
 }
 
 export interface CreateChildSessionOptions {

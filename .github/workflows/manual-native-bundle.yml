@@ -7,19 +7,52 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:packages
+      - run: pnpm --filter @moonshot-ai/agent-core-v2 --filter @moonshot-ai/klient --filter @moonshot-ai/acp-server --filter @moonshot-ai/kimi-code typecheck
+      - run: pnpm exec vitest run --maxWorkers=4 --testTimeout=15000 packages/acp-server packages/klient packages/agent-core-v2/test/agent/profile apps/kimi-code/test/scripts/native
+
   build:
+    needs: verify
     uses: ./.github/workflows/_native-build.yml
     with:
       upload-artifact-prefix: kimi-code-native
       retention-days: 3
-      sign-macos: true
-      sign-windows: true
-    secrets:
-      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_NOTARIZATION_KEY_P8: ${{ secrets.APPLE_NOTARIZATION_KEY_P8 }}
-      APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
-      APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      sign-macos: false
+      sign-windows: false
+
+  publish:
+    if: github.repository == 'gluonfield/kimi-code'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: kimi-code-native-*
+          path: dist-native-release
+          merge-multiple: true
+      - name: Verify and publish native archives
+        working-directory: dist-native-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 6
+          sha256sum --check *.sha256
+          cat > release-notes.txt <<'EOF'
+          Kimi Code 2.6.2 with session-only ACP host instructions appended to the native system prompt.
+
+          Preserves native model metadata, tools, authentication, reload and compaction behavior. Includes six standalone platform archives and SHA256 checksums.
+          EOF
+          gh release create v2.6.2-jaz.1 *.zip *.sha256 --target "$GITHUB_SHA" --title 'Kimi Code 2.6.2-jaz.1' --notes-file release-notes.txt

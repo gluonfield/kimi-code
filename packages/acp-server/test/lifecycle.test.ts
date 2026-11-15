@@ -1,10 +1,12 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   IOAuthToolkit,
+  IAgentLifecycleService,
+  IAgentLoopService,
   ISessionManager,
   ISessionMcpHandle,
   IWorkspaceInstanceManager,
@@ -375,6 +377,87 @@ describe('acp-server session lifecycle', () => {
         mcpServers: [],
       })) as { configOptions?: unknown[] };
       expect(Array.isArray(loaded.configOptions)).toBe(true);
+    },
+    30_000,
+  );
+
+  it(
+    'appends session _meta.systemPrompt to the model-facing system prompt without persisting it',
+    async () => {
+      homeDir = await mkdtemp(join(tmpdir(), 'acp-system-prompt-'));
+      await writeFakeModelConfig(homeDir);
+      const workDir = join(homeDir, 'workspace');
+      await mkdir(workDir);
+      const scripted = createScriptedProvider();
+      client = await createTestClient({ homeDir, extraSeeds: [scripted.seed] });
+      let c = client;
+      await c.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+
+      const hostA = 'Host instructions for session A (sentinel-a).';
+      const hostB = 'Host instructions for session B (sentinel-b).';
+      const params = (systemPrompt: string) => ({
+        cwd: workDir,
+        mcpServers: [],
+        _meta: { systemPrompt },
+      });
+      const baseline = (await c.send('session/new', { cwd: workDir, mcpServers: [] })) as { sessionId: string };
+      scripted.mockNextText('ok');
+      await c.send('session/prompt', { sessionId: baseline.sessionId, prompt: [{ type: 'text', text: 'hello' }] });
+      const nativeSystemPrompt = scripted.systemPrompts().at(-1)!;
+      const expectTurnSystemPrompt = async (sessionId: string, host: string): Promise<void> => {
+        scripted.mockNextText('ok');
+        await c.send('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'hello' }] });
+        const system = scripted.systemPrompts().at(-1)!;
+        expect(system).toBe(`${nativeSystemPrompt}\n\n${host}`);
+        expect(system.match(/sentinel-/g)).toHaveLength(1);
+        expect(JSON.stringify(scripted.callHistory().at(-1))).not.toContain('sentinel-');
+      };
+
+      const { sessionId: a } = (await c.send('session/new', params(hostA))) as {
+        sessionId: string;
+      };
+      const { sessionId: b } = (await c.send('session/new', params(hostB))) as {
+        sessionId: string;
+      };
+      await expectTurnSystemPrompt(a, hostA);
+      await expectTurnSystemPrompt(b, hostB);
+      const handle = c.server.core.accessor.get(ISessionManager).get(a)!;
+      const agents = handle.accessor.get(IAgentLifecycleService);
+      await agents.create({ agentId: 'append-child', binding: { profile: 'coder' } });
+      const child = agents.handleOf('append-child')!.accessor.get(IAgentLoopService);
+      const beforeChild = scripted.callCount();
+      scripted.mockNextText('child response');
+      await child.submit({ input: [{ type: 'text', text: 'child task' }] });
+      await child.settled();
+      expect(scripted.callCount()).toBe(beforeChild + 1);
+      expect(scripted.systemPrompts().at(-1)).not.toContain('sentinel-');
+
+      for (const method of ['session/load', 'session/resume']) {
+        await c.send('session/close', { sessionId: a });
+        await c.send(method, { sessionId: a, ...params(hostA) });
+        await expectTurnSystemPrompt(a, hostA);
+      }
+      const forked = (await c.send('session/fork', { sessionId: a, ...params(hostB) })) as {
+        sessionId: string;
+      };
+      await expectTurnSystemPrompt(forked.sessionId, hostB);
+
+      await c.close();
+      client = await createTestClient({ homeDir, extraSeeds: [scripted.seed] });
+      c = client;
+      await c.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+      await c.send('session/load', { sessionId: a, cwd: workDir, mcpServers: [] });
+      scripted.mockNextText('ok');
+      await c.send('session/prompt', { sessionId: a, prompt: [{ type: 'text', text: 'after restart' }] });
+      expect(scripted.systemPrompts().at(-1)).toBe(nativeSystemPrompt);
+      await c.close();
+      client = undefined;
+      const sessionsDir = join(homeDir, 'sessions');
+      for (const entry of await readdir(sessionsDir, { recursive: true, withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        const content = await readFile(join(entry.parentPath, entry.name), 'utf8');
+        expect(content, entry.name).not.toContain('sentinel-');
+      }
     },
     30_000,
   );

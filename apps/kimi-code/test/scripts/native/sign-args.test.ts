@@ -10,7 +10,7 @@ describe('buildCodesignArgs', () => {
       entitlementsPath: '/path/entitlements.plist',
       keychainPath: null,
     });
-    expect(args).toEqual(['--sign', '-', '/path/kimi']);
+    expect(args).toEqual(['--force', '--sign', '-', '/path/kimi']);
   });
 
   it('returns hardened-runtime args for Developer ID identity', () => {

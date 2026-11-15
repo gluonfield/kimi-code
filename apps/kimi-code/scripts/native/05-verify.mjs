@@ -27,6 +27,7 @@ export async function runVerifyStep({ requireGatekeeper = false } = {}) {
     return;
   }
 
+  await run('codesign', ['--verify', '--strict', '--verbose=2', executable]);
   console.log(`==> codesign -dv ${executable}`);
   await run('codesign', ['-dv', '--verbose=2', executable]);
 
